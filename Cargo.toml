@@ -61,9 +61,14 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 # are not object-safe yet.
 async-trait = "0.1"
 
-# Mesh backends, both optional.
+# Mesh backends, both optional. meshcore-rs enables BLE in its own defaults,
+# which would drag btleplug and libdbus-sys into every build and break a static
+# musl one, so its features are named explicitly and BLE is left to ours.
 meshtastic = { version = "0.1", optional = true }
-meshcore-rs = { version = "0.1", optional = true }
+meshcore-rs = { version = "0.1", optional = true, default-features = false, features = [
+  "serial",
+  "tcp",
+] }
 
 [profile.release]
 codegen-units = 1
