@@ -227,10 +227,15 @@ impl MeshtasticBackend {
                 // and anything else means it did not go anywhere — which is worth
                 // hearing about, since it otherwise looks exactly like silence.
                 if status.res == 0 {
+                    // The radio reports how many slots are *free*, which reads
+                    // backwards in a log: "15/16" looks full and means one
+                    // message waiting. Reported as occupancy instead, and as two
+                    // fields so there is no slash to read the wrong way round.
                     debug!(
                         network = %self.id,
                         packet = status.mesh_packet_id,
-                        queue = format_args!("{}/{}", status.free, status.maxlen),
+                        queued = status.maxlen.saturating_sub(status.free),
+                        capacity = status.maxlen,
                         "queued for transmission"
                     );
                 } else {
