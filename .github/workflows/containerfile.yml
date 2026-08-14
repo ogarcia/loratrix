@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Óscar García Amor <ogarcia@connectical.com>
+
+name: Containerfile
+
+# The README says `podman build -t meshtrix .` works, and nothing in the main
+# workflow would notice if it stopped: the image that gets published there is
+# assembled from prebuilt artifacts and never enters the stage that compiles.
+#
+# So this build has to happen somewhere, but not on every push. It compiles the
+# whole dependency tree inside the image with no cargo cache to lean on, which
+# made it the longest job of the run by a factor of three and half its runner
+# minutes. What it actually guards against is a change to the recipe or to the
+# dependencies it has to compile, so those are what it waits for. Source changes
+# cannot break it in a way the ordinary build would not catch first.
+#
+# Not Cargo.lock, though a new C dependency is exactly what this catches: a
+# `cargo update` moves versions around in it constantly and hardly ever changes
+# what has to be installed to compile them. Cargo.toml is where a dependency
+# arrives, and that is the signal worth three minutes.
+#
+# The two lists are written out rather than shared through a YAML anchor. An
+# alias that did not resolve the way it reads would fail quietly and in the
+# wrong direction, by running this on every pull request instead of none.
+on:
+  push:
+    paths:
+      - Containerfile
+      - .containerignore
+      - Cargo.toml
+      - .github/workflows/containerfile.yml
+  pull_request:
+    paths:
+      - Containerfile
+      - .containerignore
+      - Cargo.toml
+      - .github/workflows/containerfile.yml
+  # And on demand, which is what to reach for before tagging a release.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Compiled in the image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # One architecture, loaded and thrown away. What is under test is that it
+      # still compiles and links statically inside Alpine, which is a different
+      # question from whether it does on a runner.
+      - name: Build the compiled-here path
+        run: docker buildx build --platform linux/amd64 --load --tag meshtrix:from-source .
+
+      - run: docker run --rm meshtrix:from-source --version

@@ -140,25 +140,6 @@ jobs:
           path: target/${{ matrix.target }}/release/meshtrix
           if-no-files-found: error
 
-  image-from-source:
-    name: Container image, compiled in it
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: docker/setup-buildx-action@v4
-
-      # The README says `podman build -t meshtrix .` works, and nothing else here
-      # would notice if it stopped: the image that gets published is assembled
-      # from the artifacts the binary job made and never enters that stage. One
-      # architecture, loaded and thrown away — what is under test is that it
-      # still compiles and links statically inside Alpine, which is a different
-      # question from whether it does on a runner.
-      - name: Build the compiled-here path
-        run: docker buildx build --platform linux/amd64 --load --tag meshtrix:from-source .
-
-      - run: docker run --rm meshtrix:from-source --version
-
   image:
     name: Container image
     needs: binary
