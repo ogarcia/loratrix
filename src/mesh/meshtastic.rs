@@ -12,7 +12,6 @@
 //! either can be told apart.
 
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::sync::RwLock as SyncRwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -20,9 +19,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use meshtastic::api::{ConnectedStreamApi, StreamApi};
-use meshtastic::packet::{PacketDestination, PacketReceiver, PacketRouter};
+use meshtastic::packet::PacketReceiver;
 use meshtastic::protobufs;
-use meshtastic::types::{MeshChannel, NodeId};
+use meshtastic::types::MeshChannel;
 use meshtastic::utils;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Instant, sleep, sleep_until};
@@ -33,6 +32,26 @@ use crate::mesh::{IncomingMesh, MeshBackend, MeshKind, NetworkId, Origin, PeerId
 
 /// Every node, rather than one of them. Meshtastic has no constant for it.
 const BROADCAST_ADDR: u32 = 0xffff_ffff;
+
+/// How many times a packet of ours may be repeated by other nodes. This has to be
+/// set, and set to something other than zero, or the message is heard by immediate
+/// neighbours and by nobody beyond them.
+///
+/// The firmware only fills the field in for us under one narrow condition:
+///
+/// ```text
+/// if (src == RX_SRC_USER && p->want_ack && p->hop_limit == 0)
+///     p->hop_limit = Default::getConfiguredOrDefaultHopLimit(config.lora.hop_limit);
+/// ```
+///
+/// A channel broadcast asks for no acknowledgement, so it does not qualify, and a
+/// zero we leave in place is a zero that goes out on the air. The radio reports its
+/// configured limit while it is configuring the session and that is what we use;
+/// this is the firmware's own fallback, for the moment before it has said.
+const DEFAULT_HOP_LIMIT: u32 = 3;
+/// The protocol's ceiling. The firmware ignores anything above it and falls back to
+/// the default, so a radio reporting more than this is reporting nonsense.
+const MAX_HOP_LIMIT: u32 = 7;
 
 /// Firmware refuses to transmit faster than this, so it is a floor rather than a
 /// preference.
@@ -64,30 +83,6 @@ enum Outcome {
     Stop,
 }
 
-/// The crate's send path insists on a router to hand packets to, so that a client
-/// can see its own traffic echoed back. We route in [`crate::router`] from what
-/// the listener gives us, so the echo is dropped and this answers only the one
-/// question that has to be answered: which node we are, which the radio stamps on
-/// everything we send.
-struct OwnRouter(NodeId);
-
-impl PacketRouter<(), Infallible> for OwnRouter {
-    fn handle_packet_from_radio(
-        &mut self,
-        _packet: protobufs::FromRadio,
-    ) -> Result<(), Infallible> {
-        Ok(())
-    }
-
-    fn handle_mesh_packet(&mut self, _packet: protobufs::MeshPacket) -> Result<(), Infallible> {
-        Ok(())
-    }
-
-    fn source_node_id(&self) -> NodeId {
-        self.0
-    }
-}
-
 pub struct MeshtasticBackend {
     id: NetworkId,
     link: Link,
@@ -97,6 +92,9 @@ pub struct MeshtasticBackend {
     /// The radio's own node number, which is how a direct message is recognized.
     /// Zero until the radio says, which is not a valid node number.
     my_node_num: AtomicU32,
+    /// How far the radio is configured to let a packet travel, learnt from its LoRa
+    /// config while the session is being set up. The firmware's default until then.
+    hop_limit: AtomicU32,
     /// The configured connection, replaced on every reconnect. Sending needs it
     /// mutably, and sends can arrive while there is none.
     api: Mutex<Option<ConnectedStreamApi>>,
@@ -137,6 +135,7 @@ impl MeshtasticBackend {
             link,
             names: SyncRwLock::new(HashMap::new()),
             my_node_num: AtomicU32::new(0),
+            hop_limit: AtomicU32::new(DEFAULT_HOP_LIMIT),
             api: Mutex::new(None),
             next_send: Mutex::new(None),
         })
@@ -176,7 +175,7 @@ impl MeshtasticBackend {
         // The node database arrives unasked as part of configuring, so the names
         // are in hand before the first message needs one. Cleared first, in case
         // the radio is not the one we last spoke to.
-        self.forget_names();
+        self.forget_radio();
         *self.api.lock().await = Some(api);
 
         let outcome = loop {
@@ -218,6 +217,13 @@ impl MeshtasticBackend {
             }
             PayloadVariant::NodeInfo(node) => {
                 self.remember_name(&node);
+                None
+            }
+            PayloadVariant::Config(config) => {
+                if let Some(protobufs::config::PayloadVariant::Lora(lora)) = config.payload_variant
+                {
+                    self.learn_hop_limit(lora.hop_limit);
+                }
                 None
             }
             PayloadVariant::QueueStatus(status) => {
@@ -368,11 +374,29 @@ impl MeshtasticBackend {
         }
     }
 
-    fn forget_names(&self) {
+    /// Drop everything learnt from a radio, because the next connection may not be
+    /// to the same one — and a hop limit or a name carried over from another radio
+    /// would be worse than not knowing.
+    fn forget_radio(&self) {
         match self.names.write() {
             Ok(mut names) => names.clear(),
             Err(_) => warn!(network = %self.id, "the name cache lock is poisoned"),
         }
+        self.hop_limit.store(DEFAULT_HOP_LIMIT, Ordering::Relaxed);
+    }
+
+    /// Take the hop limit from the radio's LoRa config, if it is one the protocol
+    /// allows. Zero means the radio is itself relying on the firmware default, and
+    /// anything above the ceiling is a value the firmware would refuse; either way
+    /// the default is the honest answer rather than the number as reported.
+    fn learn_hop_limit(&self, reported: u32) {
+        let hops = if (1..=MAX_HOP_LIMIT).contains(&reported) {
+            reported
+        } else {
+            DEFAULT_HOP_LIMIT
+        };
+        self.hop_limit.store(hops, Ordering::Relaxed);
+        info!(network = %self.id, hops, "hop limit for what we send");
     }
 
     /// Wait until this network's turn to transmit comes round. Done before
@@ -385,13 +409,42 @@ impl MeshtasticBackend {
         *next_send = Some(Instant::now() + MIN_SEND_INTERVAL);
     }
 
+    /// The packet we would put on the air to say this, addressed as told.
+    ///
+    /// Built by hand rather than through the crate's `send_text`, which offers no
+    /// way to set a hop limit and leaves the field at zero. See [`DEFAULT_HOP_LIMIT`]
+    /// for why that alone is enough to make a relay look like it is working while
+    /// nothing it says travels past the nodes in earshot.
+    fn outgoing(&self, to: u32, channel: MeshChannel, text: &str) -> protobufs::MeshPacket {
+        protobufs::MeshPacket {
+            payload_variant: Some(protobufs::mesh_packet::PayloadVariant::Decoded(
+                protobufs::Data {
+                    portnum: protobufs::PortNum::TextMessageApp as i32,
+                    payload: text.as_bytes().to_vec(),
+                    ..Default::default()
+                },
+            )),
+            // The firmware overwrites both of these — it refuses to let a client
+            // name itself, and stamps its own arrival time — but they cost nothing
+            // and make the packet readable in a log before it is sent.
+            from: self.my_node_num.load(Ordering::Relaxed),
+            to,
+            id: utils::generate_rand_id(),
+            channel: channel.channel(),
+            hop_limit: self.hop_limit.load(Ordering::Relaxed),
+            // No acknowledgement asked for: a broadcast cannot be acknowledged in
+            // any useful way, and for a direct message the answer would arrive long
+            // after the relay had stopped caring.
+            want_ack: false,
+            // What the reference client sends for a message a person typed. Left
+            // unset the firmware picks for us, and picks lower.
+            priority: protobufs::mesh_packet::Priority::Reliable as i32,
+            ..Default::default()
+        }
+    }
+
     /// Hand text to the radio, addressed as told.
-    async fn transmit(
-        &self,
-        destination: PacketDestination,
-        channel: u8,
-        text: &str,
-    ) -> Result<()> {
+    async fn transmit(&self, to: u32, channel: u8, text: &str) -> Result<()> {
         let channel = MeshChannel::new(u32::from(channel)).map_err(|error| {
             anyhow::anyhow!("channel {channel} is not one a radio has: {error}")
         })?;
@@ -403,12 +456,18 @@ impl MeshtasticBackend {
             Some(api) => api,
             None => bail!("network {:?} is not connected", self.id),
         };
-        let mut router = OwnRouter(NodeId::new(self.my_node_num.load(Ordering::Relaxed)));
 
-        // No acknowledgement asked for: a broadcast cannot be acknowledged in any
-        // useful way, and for a direct message the answer would arrive long after
-        // the relay had stopped caring.
-        api.send_text(&mut router, text.to_owned(), destination, false, channel)
+        let packet = self.outgoing(to, channel, text);
+        // Logged before sending, and with the packet id, because that is what the
+        // radio's queue report comes back naming.
+        debug!(
+            network = %self.id,
+            packet = packet.id,
+            channel = packet.channel,
+            hops = packet.hop_limit,
+            "handing a packet to the radio"
+        );
+        api.send_to_radio_packet(Some(protobufs::to_radio::PayloadVariant::Packet(packet)))
             .await
             .with_context(|| format!("sending on {}", self.id))
     }
@@ -457,8 +516,7 @@ impl MeshBackend for MeshtasticBackend {
     }
 
     async fn send_channel(&self, channel: u8, text: &str) -> Result<()> {
-        self.transmit(PacketDestination::Broadcast, channel, text)
-            .await
+        self.transmit(BROADCAST_ADDR, channel, text).await
     }
 
     async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<()> {
@@ -467,8 +525,7 @@ impl MeshBackend for MeshtasticBackend {
         };
         // The primary channel, which is where a direct message goes: the address
         // is what makes it private, not the channel.
-        self.transmit(PacketDestination::Node(NodeId::new(*num)), 0, text)
-            .await
+        self.transmit(*num, 0, text).await
     }
 
     fn resolve_name(&self, peer: &PeerId) -> Option<String> {
@@ -704,11 +761,112 @@ mod tests {
     }
 
     #[test]
-    fn a_reconnect_forgets_the_last_radio_node_database() {
+    fn a_reconnect_forgets_what_the_last_radio_said() {
         let backend = offline_backend();
         backend.remember_name(&node_info(7, "Alice", "AL"));
-        backend.forget_names();
+        backend.learn_hop_limit(7);
+
+        backend.forget_radio();
+
         assert_eq!(backend.resolve_name(&PeerId::Node(7)), None);
+        assert_eq!(
+            backend.hop_limit.load(Ordering::Relaxed),
+            DEFAULT_HOP_LIMIT,
+            "another radio's hop limit is not one to keep"
+        );
+    }
+
+    /// A LoRa config, as the radio sends one while configuring the session.
+    fn lora_config(hop_limit: u32) -> protobufs::FromRadio {
+        protobufs::FromRadio {
+            payload_variant: Some(protobufs::from_radio::PayloadVariant::Config(
+                protobufs::Config {
+                    payload_variant: Some(protobufs::config::PayloadVariant::Lora(
+                        protobufs::config::LoRaConfig {
+                            hop_limit,
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// The regression that matters most in this file. A packet sent with a hop limit
+    /// of zero is transmitted and then repeated by nobody, so it reaches whatever is
+    /// in earshot and stops there — a relay that looks connected, queues its
+    /// packets, reports no error and is heard by nothing.
+    #[test]
+    fn an_outgoing_packet_is_always_allowed_some_hops() {
+        let packet = offline_backend().outgoing(
+            BROADCAST_ADDR,
+            MeshChannel::new(0).expect("channel nought"),
+            "bos dias",
+        );
+        assert_ne!(
+            packet.hop_limit, 0,
+            "a message nobody may repeat is a message nobody hears"
+        );
+        assert_eq!(packet.hop_limit, DEFAULT_HOP_LIMIT);
+    }
+
+    #[test]
+    fn takes_the_hop_limit_from_the_radio() {
+        let backend = offline_backend();
+        backend.absorb(lora_config(5));
+
+        let packet = backend.outgoing(
+            BROADCAST_ADDR,
+            MeshChannel::new(0).expect("channel nought"),
+            "bos dias",
+        );
+        assert_eq!(packet.hop_limit, 5);
+    }
+
+    #[test]
+    fn a_hop_limit_no_radio_would_honour_falls_back_to_the_default() {
+        let backend = offline_backend();
+
+        // Zero is what a radio reports when it is itself relying on the firmware
+        // default, and eight is above the protocol's ceiling of seven, which the
+        // firmware answers by using the default too. Repeating either back would be
+        // repeating a number that means something else.
+        for reported in [0, MAX_HOP_LIMIT + 1, 255] {
+            backend.absorb(lora_config(reported));
+            assert_eq!(
+                backend.hop_limit.load(Ordering::Relaxed),
+                DEFAULT_HOP_LIMIT,
+                "a reported limit of {reported} is not one to send with"
+            );
+        }
+    }
+
+    /// What we put on the air, beyond the hop limit: the fields the firmware reads
+    /// to decide where a packet goes and how it is treated once queued.
+    #[test]
+    fn an_outgoing_packet_says_what_it_is() {
+        let backend = offline_backend();
+        backend.my_node_num.store(42, Ordering::Relaxed);
+
+        let packet = backend.outgoing(9, MeshChannel::new(3).expect("channel three"), "hola");
+
+        assert_eq!(packet.from, 42);
+        assert_eq!(packet.to, 9);
+        assert_eq!(packet.channel, 3);
+        assert_ne!(packet.id, 0, "the firmware would have to invent one");
+        assert!(!packet.want_ack, "a relay is not waiting for an answer");
+        assert_eq!(
+            packet.priority,
+            protobufs::mesh_packet::Priority::Reliable as i32
+        );
+
+        let Some(protobufs::mesh_packet::PayloadVariant::Decoded(data)) = packet.payload_variant
+        else {
+            panic!("a text message goes out decoded, for the radio to encrypt");
+        };
+        assert_eq!(data.portnum, protobufs::PortNum::TextMessageApp as i32);
+        assert_eq!(data.payload, b"hola");
     }
 
     #[tokio::test]

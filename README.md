@@ -136,6 +136,29 @@ same radio, put a multiplexer in front of it — for MeshCore,
 [coresplitter](https://github.com/ogarcia/coresplitter) does exactly that — and
 point `transport` at the multiplexer instead.
 
+## A hop limit of zero is not a default
+
+Meshtastic packets carry a hop limit: how many times another node may repeat them.
+Zero is a legal value and it means *nobody repeats this*, so the message reaches
+whatever is in earshot of the radio and stops there.
+
+The firmware fills the field in for a client that left it empty, but only under one
+condition:
+
+```c
+if (src == RX_SRC_USER && p->want_ack && p->hop_limit == 0)
+    p->hop_limit = Default::getConfiguredOrDefaultHopLimit(config.lora.hop_limit);
+```
+
+A channel broadcast asks for no acknowledgement, so it does not qualify. The relay
+therefore sets the limit itself, to whatever the radio reports in its own LoRa
+config — the reference Python client does the same — and falls back to the
+firmware's default of three where that is zero or above the ceiling of seven.
+
+Worth knowing because of how it fails: the radio accepts the packet, queues it,
+reports no error, and the relay logs a successful send. Everything looks right and
+nothing is heard beyond the first hop.
+
 ## Homeservers do not all filter
 
 The relay asks `/sync` for the bridged rooms only, messages only, and no history
