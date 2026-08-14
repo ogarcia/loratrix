@@ -79,6 +79,11 @@ impl HttpSink {
             );
         }
 
+        // Which server and which account, before anything is said about rooms.
+        // A relay pointed at the wrong homeserver, or logged in as the wrong
+        // account, otherwise looks like a relay whose rooms are all empty.
+        info!(homeserver = %homeserver, user = %config.user_id, "matrix account");
+
         Ok(Self {
             client: reqwest::Client::builder()
                 .user_agent(concat!("meshtrix/", env!("CARGO_PKG_VERSION")))

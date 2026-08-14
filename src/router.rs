@@ -133,7 +133,7 @@ impl Router {
             }
         }
 
-        Ok(Self {
+        let router = Self {
             backends,
             matrix,
             relay: config.relay.clone(),
@@ -142,7 +142,33 @@ impl Router {
             dm_inboxes,
             read_only,
             dedupe: Mutex::new(Dedupe::new(config.relay.dedupe_window())),
-        })
+        };
+        router.log_prefixes();
+        Ok(router)
+    }
+
+    /// Say which templates are actually going to be used, for each protocol that
+    /// is configured.
+    ///
+    /// Resolved rather than as written, because that is where the surprises are: a
+    /// per-protocol override that did not apply, or the general one winning when
+    /// an override was meant to. Quoted, because a trailing space is part of a
+    /// prefix and an empty template is a deliberate choice, and neither shows up
+    /// otherwise.
+    fn log_prefixes(&self) {
+        for kind in [MeshKind::Meshtastic, MeshKind::MeshCore] {
+            if !self.backends.values().any(|backend| backend.kind() == kind) {
+                continue;
+            }
+            info!(
+                protocol = %kind,
+                to_matrix = ?self.relay.mesh_to_matrix(Some(kind)),
+                from_matrix = ?self.relay.matrix_to_mesh(Some(kind)),
+                from_other_mesh = ?self.relay.mesh_to_mesh(Some(kind)),
+                direct_to_matrix = ?self.relay.dm(Some(kind)),
+                "prefixes"
+            );
+        }
     }
 
     /// Every room the relay has to be a member of.
