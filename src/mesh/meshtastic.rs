@@ -227,6 +227,14 @@ impl MeshtasticBackend {
                 // and anything else means it did not go anywhere — which is worth
                 // hearing about, since it otherwise looks exactly like silence.
                 if status.res == 0 {
+                    // Every five minutes the library sends a heartbeat and the
+                    // radio answers with one of these carrying no packet id at
+                    // all. Saying "queued for transmission" about that would be
+                    // untrue, and would be untrue on a schedule.
+                    if status.mesh_packet_id == 0 {
+                        trace!(network = %self.id, "the radio answered a heartbeat");
+                        return None;
+                    }
                     // The radio reports how many slots are *free*, which reads
                     // backwards in a log: "15/16" looks full and means one
                     // message waiting. Reported as occupancy instead, and as two
