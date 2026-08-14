@@ -43,6 +43,9 @@ toml = "1"
 # features are off to keep cookies, gzip and blocking support out of the graph.
 reqwest = { version = "0.13", default-features = false, features = [
   "json",
+  # /sync carries its filter and stream position as query parameters, and
+  # hand-rolling that encoding is exactly the sort of thing to get wrong once.
+  "query",
   "rustls",
   "rustls-native-certs",
 ] }

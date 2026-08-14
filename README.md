@@ -10,11 +10,15 @@ carries 42k lines of source and 90-180 MB of RSS to do a job that needs neither.
 
 ## Status
 
-Early. The routing core, configuration, prefix handling and duplicate
-suppression are implemented and tested. The two mesh backends and the Matrix
-`/sync` loop are skeletons that report they are not implemented yet, so the
-relay does not relay anything at all so far. `--check` already works and is
-useful for validating a configuration.
+Early, but no longer inert. The routing core, the configuration, the MeshCore
+backend and the Matrix side are implemented and tested; the Meshtastic backend is
+still a skeleton that reports it is not implemented. So a MeshCore mesh can be
+bridged and a Meshtastic one cannot, yet.
+
+Verified against real hardware and a real homeserver: the MeshCore handshake, a
+contact list of 350, a message accepted for transmission, and 80 real Matrix
+events parsed. What has not been seen end to end is a message arriving *from* a
+mesh, for want of anybody sending one while it was watching.
 
 ## What it does
 
@@ -117,6 +121,24 @@ Worth knowing, because it shows up in the output:
   against the contact list.
 
 This is also why echo suppression is content-based rather than sender-based.
+
+A radio, either kind, accepts **one connection at a time**, so while the relay is
+attached nothing else can be. If you want to keep using a phone app against the
+same radio, put a multiplexer in front of it — for MeshCore,
+[coresplitter](https://github.com/ogarcia/coresplitter) does exactly that — and
+point `transport` at the multiplexer instead.
+
+## Homeservers do not all filter
+
+The relay asks `/sync` for the bridged rooms only, messages only, and no history
+on the first request. Where that is honoured it saves a lot of traffic.
+
+It is not always honoured. conduwuit ignores `/sync` filters entirely, inline or
+registered alike, and answers with the last ten events of every joined room. So
+the filter is treated as an optimization and never as a guarantee: starting from
+now rather than from history, and relaying only bridged rooms, are both enforced
+in the relay. Without that, every restart would read the tail of each room out
+over the mesh.
 
 ## Development
 
