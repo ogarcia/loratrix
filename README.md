@@ -124,7 +124,11 @@ Worth knowing, because it shows up in the output:
   So `EA1HYZ 📟: hola` on a MeshCore channel reaches Matrix as
   `[EA1HYZ 📟/mc]: hola`, which is what a Meshtastic message looks like too.
 
-This is also why echo suppression is content-based rather than sender-based.
+This is also why echo suppression is content-based rather than sender-based, and
+why every prefix template comes in three: a general one and a per-protocol
+override that wins where it is set. Meshtastic carries a short name as well as a
+long one, so `[{short}/{long}]` is worth writing there and meaningless on
+MeshCore. `{name}` is the placeholder that is never left blank.
 
 A radio, either kind, accepts **one connection at a time**, so while the relay is
 attached nothing else can be. If you want to keep using a phone app against the

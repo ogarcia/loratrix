@@ -17,15 +17,43 @@ access_token_file = "~/.config/meshtrix/token"
 # How long a relayed message is remembered, to drop duplicates and the relay's
 # own echo coming back off another mesh.
 #dedupe_window_secs = 30
-# Prefix templates. Placeholders: {name}, {network}, {network_tag}, {channel}.
-# A trailing number caps the value in bytes, so {name5} is at most five bytes.
+# Prefix templates. Placeholders:
+#
+#   {name}         best name there is, and the only one never left blank:
+#                  the long name, else the short one, else unknown_sender_name
+#   {long}         the sender's long name, empty if the protocol gave none
+#   {short}        the sender's short name — Meshtastic only; MeshCore has none
+#   {network}      the name given to the network in [[networks]]
+#   {network_tag}  "[network]" in a DM inbox listening to more than one, else ""
+#   {channel}      channel index, empty for a direct message
+#
+# A trailing number caps a value in bytes, so {name5} is at most five bytes and
+# {short2} at most two.
+#
+# Every direction has a general template and a per-protocol override. Where an
+# override is set it wins; otherwise the general one applies. That is what makes
+# {short} usable: it exists on Meshtastic and not on MeshCore, so the template
+# that asks for it should only be the Meshtastic one.
 #mesh_to_matrix_prefix = "[{name}/{network}]: "
+#meshtastic_to_matrix_prefix = "[{short}/{long}]: "
+#meshcore_to_matrix_prefix = "[{name}/{network}]: "
+
 #matrix_to_mesh_prefix = "{name5}[M]: "
+#matrix_to_meshtastic_prefix = "{name5}[M]: "
+#matrix_to_meshcore_prefix = "{name}: "
+
+# Used when a room has more than one route and a message is fanned out to the
+# other mesh. Named for where it is going, since that is whose payload it spends.
 #mesh_to_mesh_prefix = "{name5}[{network4}]: "
+#meshtastic_to_meshcore_prefix = "{name}: "
+#meshcore_to_meshtastic_prefix = "{name5}[{network4}]: "
+
 #dm_prefix = "[DM]{network_tag} {name}: "
-# Shown instead of a name when the protocol does not carry one, which is the
-# case for every MeshCore channel message: there the sender's name travels
-# inside the message text by client convention.
+#meshtastic_dm_prefix = "[DM]{network_tag} {short}: "
+#meshcore_dm_prefix = "[DM]{network_tag} {name}: "
+
+# Shown instead of a name when the protocol does not carry one and none could be
+# read out of the text. See the note on MeshCore channels in the README.
 #unknown_sender_name = "unknown"
 
 # One entry per radio. The name is how rooms refer to it, and it appears in

@@ -10,6 +10,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::mesh::MeshKind;
+
 /// Default TCP port used by both Meshtastic and MeshCore companion radios.
 const DEFAULT_MESHTASTIC_TCP_PORT: u16 = 4403;
 const DEFAULT_MESHCORE_TCP_PORT: u16 = 5000;
@@ -76,20 +78,40 @@ pub struct RelayConfig {
     /// back, and what absorbs MQTT duplicates on Meshtastic.
     #[serde(default = "default_dedupe_window_secs")]
     pub dedupe_window_secs: u64,
-    /// Prefix prepended to mesh messages on their way into Matrix.
+    /// Prefix prepended to mesh messages on their way into Matrix. Applies to
+    /// both protocols; the two below override it for one of them.
     #[serde(default = "default_mesh_to_matrix_prefix")]
     pub mesh_to_matrix_prefix: String,
+    #[serde(default)]
+    pub meshtastic_to_matrix_prefix: Option<String>,
+    #[serde(default)]
+    pub meshcore_to_matrix_prefix: Option<String>,
+
     /// Prefix prepended to Matrix messages on their way into a mesh channel.
     #[serde(default = "default_matrix_to_mesh_prefix")]
     pub matrix_to_mesh_prefix: String,
+    #[serde(default)]
+    pub matrix_to_meshtastic_prefix: Option<String>,
+    #[serde(default)]
+    pub matrix_to_meshcore_prefix: Option<String>,
+
     /// Prefix used when fanning a mesh message out to another mesh, which
     /// happens when one room has more than one route. Kept short because it
     /// spends a LoRa payload budget rather than a Matrix one.
     #[serde(default = "default_mesh_to_mesh_prefix")]
     pub mesh_to_mesh_prefix: String,
+    #[serde(default)]
+    pub meshtastic_to_meshcore_prefix: Option<String>,
+    #[serde(default)]
+    pub meshcore_to_meshtastic_prefix: Option<String>,
+
     /// Prefix used for direct messages landing in a read-only DM inbox room.
     #[serde(default = "default_dm_prefix")]
     pub dm_prefix: String,
+    #[serde(default)]
+    pub meshtastic_dm_prefix: Option<String>,
+    #[serde(default)]
+    pub meshcore_dm_prefix: Option<String>,
     /// Stand-in for `{name}` when the protocol did not tell us who sent the
     /// message, which is every MeshCore channel message. The real name is
     /// usually inside the text itself.
@@ -102,9 +124,17 @@ impl Default for RelayConfig {
         Self {
             dedupe_window_secs: default_dedupe_window_secs(),
             mesh_to_matrix_prefix: default_mesh_to_matrix_prefix(),
+            meshtastic_to_matrix_prefix: None,
+            meshcore_to_matrix_prefix: None,
             matrix_to_mesh_prefix: default_matrix_to_mesh_prefix(),
+            matrix_to_meshtastic_prefix: None,
+            matrix_to_meshcore_prefix: None,
             mesh_to_mesh_prefix: default_mesh_to_mesh_prefix(),
+            meshtastic_to_meshcore_prefix: None,
+            meshcore_to_meshtastic_prefix: None,
             dm_prefix: default_dm_prefix(),
+            meshtastic_dm_prefix: None,
+            meshcore_dm_prefix: None,
             unknown_sender_name: default_unknown_sender_name(),
         }
     }
@@ -113,6 +143,69 @@ impl Default for RelayConfig {
 impl RelayConfig {
     pub fn dedupe_window(&self) -> Duration {
         Duration::from_secs(self.dedupe_window_secs)
+    }
+
+    /// Template for a mesh message going to Matrix.
+    ///
+    /// Each direction has a general template and a per-protocol override, and the
+    /// override wins where it is set. That exists because the two protocols do not
+    /// carry the same things: only Meshtastic has a short name, so a template
+    /// using `{short}` is only worth writing for one of them.
+    pub fn mesh_to_matrix(&self, from: Option<MeshKind>) -> &str {
+        self.per_kind(
+            from,
+            &self.meshtastic_to_matrix_prefix,
+            &self.meshcore_to_matrix_prefix,
+            &self.mesh_to_matrix_prefix,
+        )
+    }
+
+    /// Template for a Matrix message going to a mesh channel.
+    pub fn matrix_to_mesh(&self, to: Option<MeshKind>) -> &str {
+        self.per_kind(
+            to,
+            &self.matrix_to_meshtastic_prefix,
+            &self.matrix_to_meshcore_prefix,
+            &self.matrix_to_mesh_prefix,
+        )
+    }
+
+    /// Template for a direct message going to its inbox room.
+    pub fn dm(&self, from: Option<MeshKind>) -> &str {
+        self.per_kind(
+            from,
+            &self.meshtastic_dm_prefix,
+            &self.meshcore_dm_prefix,
+            &self.dm_prefix,
+        )
+    }
+
+    /// Template for a mesh message fanned out to the other mesh in its room.
+    /// Named for where it is going, since that is whose payload it spends.
+    pub fn mesh_to_mesh(&self, to: Option<MeshKind>) -> &str {
+        self.per_kind(
+            to,
+            // Going *to* Meshtastic means it came from MeshCore, there being two.
+            &self.meshcore_to_meshtastic_prefix,
+            &self.meshtastic_to_meshcore_prefix,
+            &self.mesh_to_mesh_prefix,
+        )
+    }
+
+    /// `None` means the protocol is not known, which leaves the general template.
+    fn per_kind<'a>(
+        &self,
+        kind: Option<MeshKind>,
+        meshtastic: &'a Option<String>,
+        meshcore: &'a Option<String>,
+        general: &'a str,
+    ) -> &'a str {
+        match kind {
+            Some(MeshKind::Meshtastic) => meshtastic.as_deref(),
+            Some(MeshKind::MeshCore) => meshcore.as_deref(),
+            None => None,
+        }
+        .unwrap_or(general)
     }
 }
 

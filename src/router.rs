@@ -18,13 +18,52 @@ use std::time::Instant;
 
 use anyhow::{Result, bail};
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{Config, RelayConfig, Route};
 use crate::dedupe::{Dedupe, message_key};
 use crate::matrix::{MatrixMessage, MatrixSink, RoomId};
-use crate::mesh::{IncomingMesh, MeshBackend, NetworkId, Origin};
+use crate::mesh::{IncomingMesh, MeshBackend, MeshKind, NetworkId, Origin, Sender};
 use crate::prefix::{self, Vars};
+
+/// The name placeholders a template can ask for, worked out once from whatever
+/// the protocol actually carried.
+///
+/// `long` and `short` are left empty when they were not given, which for MeshCore
+/// is always the case for `short`. `name` is the one that never comes out blank:
+/// the long name, else the short one, else the configured stand-in. That is the
+/// whole reason for having a template per protocol — `{short}` is only worth
+/// writing where there is one.
+#[derive(Default)]
+struct Names {
+    name: String,
+    long: String,
+    short: String,
+}
+
+impl Names {
+    /// A Matrix sender, of whom we know one name and call it all three. Fetching
+    /// a display name would be another API call and a cache; the localpart is
+    /// stable and short, which is what a mesh payload wants.
+    fn of_matrix_user(localpart: &str) -> Self {
+        Self {
+            name: localpart.to_owned(),
+            long: localpart.to_owned(),
+            short: localpart.to_owned(),
+        }
+    }
+
+    fn vars<'a>(&'a self, network: &'a str, network_tag: &'a str, channel: Option<u8>) -> Vars<'a> {
+        Vars {
+            name: &self.name,
+            long: &self.long,
+            short: &self.short,
+            network,
+            network_tag,
+            channel,
+        }
+    }
+}
 
 /// A DM inbox room fed by one or more networks.
 struct DmTarget {
@@ -197,28 +236,30 @@ impl Router {
             return;
         };
 
-        let name = self.sender_name(message);
-        let vars = Vars {
-            name: &name,
-            network: &message.network,
-            network_tag: "",
-            channel: Some(channel),
-        };
-
+        let names = self.names_of(message.sender.as_ref());
+        let template = self.relay.mesh_to_matrix(self.kind_of(&message.network));
         let body = format!(
             "{}{}",
-            prefix::render(&self.relay.mesh_to_matrix_prefix, &vars),
+            prefix::render(template, &names.vars(&message.network, "", Some(channel))),
             message.text
         );
-        if let Err(error) = self.matrix.send_text(room, &body).await {
-            warn!(room = %room, %error, "failed to relay a mesh message to Matrix");
+
+        match self.matrix.send_text(room, &body).await {
+            Ok(()) => info!(
+                network = %message.network,
+                channel,
+                room = %room,
+                sender = %names.name,
+                "mesh -> matrix"
+            ),
+            Err(error) => warn!(room = %room, %error, "failed to relay a mesh message to Matrix"),
         }
 
-        self.fan_out(message, room, &name, now).await;
+        self.fan_out(message, room, &names, now).await;
     }
 
     /// Forward a mesh message to the other meshes sharing its room.
-    async fn fan_out(&self, message: &IncomingMesh, room: &str, name: &str, now: Instant) {
+    async fn fan_out(&self, message: &IncomingMesh, room: &str, names: &Names, now: Instant) {
         let Some(routes) = self.outbound.get(room) else {
             return;
         };
@@ -231,14 +272,12 @@ impl Router {
                 continue;
             };
 
-            let vars = Vars {
-                name,
-                network: &message.network,
-                network_tag: "",
-                channel: Some(route.channel),
-            };
+            let template = self.relay.mesh_to_mesh(Some(backend.kind()));
             let payload = prefix::fit(
-                &prefix::render(&self.relay.mesh_to_mesh_prefix, &vars),
+                &prefix::render(
+                    template,
+                    &names.vars(&message.network, "", Some(route.channel)),
+                ),
                 &message.text,
                 backend.max_payload(),
             );
@@ -250,13 +289,19 @@ impl Router {
                 now,
             );
 
-            if let Err(error) = backend.send_channel(route.channel, &payload).await {
-                warn!(
+            match backend.send_channel(route.channel, &payload).await {
+                Ok(()) => info!(
+                    from = %message.network,
+                    network = %route.network,
+                    channel = route.channel,
+                    "mesh -> mesh"
+                ),
+                Err(error) => warn!(
                     network = %route.network,
                     channel = route.channel,
                     %error,
                     "failed to fan a mesh message out to another mesh"
-                );
+                ),
             }
         }
     }
@@ -271,16 +316,17 @@ impl Router {
             return;
         };
 
-        // A DM always carries identity, but fall back to the peer address if the
-        // name is not in the backend's cache yet.
-        let name = match self.sender_display_name(message) {
-            Some(name) => name,
-            None => self
+        // A DM always carries identity, but fall back to the backend's cache and
+        // then to the peer address if no name came with it.
+        let mut names = self.names_of(message.sender.as_ref());
+        if self.sender_display_name(message).is_none() {
+            names.name = self
                 .backends
                 .get(&message.network)
                 .and_then(|backend| backend.resolve_name(peer))
-                .unwrap_or_else(|| peer.to_string()),
-        };
+                .unwrap_or_else(|| peer.to_string());
+        }
+        let template = self.relay.dm(self.kind_of(&message.network));
 
         for target in targets {
             let tag = if target.tag_network {
@@ -288,19 +334,21 @@ impl Router {
             } else {
                 String::new()
             };
-            let vars = Vars {
-                name: &name,
-                network: &message.network,
-                network_tag: &tag,
-                channel: None,
-            };
             let body = format!(
                 "{}{}",
-                prefix::render(&self.relay.dm_prefix, &vars),
+                prefix::render(template, &names.vars(&message.network, &tag, None)),
                 message.text
             );
-            if let Err(error) = self.matrix.send_text(&target.room, &body).await {
-                warn!(room = %target.room, %error, "failed to mirror a direct message");
+            match self.matrix.send_text(&target.room, &body).await {
+                Ok(()) => info!(
+                    network = %message.network,
+                    room = %target.room,
+                    sender = %names.name,
+                    "direct message -> matrix"
+                ),
+                Err(error) => {
+                    warn!(room = %target.room, %error, "failed to mirror a direct message")
+                }
             }
         }
     }
@@ -322,20 +370,18 @@ impl Router {
             return;
         };
 
-        let name = matrix_localpart(&message.sender);
+        let names = Names::of_matrix_user(matrix_localpart(&message.sender));
         for route in routes {
             let Some(backend) = self.backends.get(&route.network) else {
                 continue;
             };
 
-            let vars = Vars {
-                name,
-                network: &route.network,
-                network_tag: "",
-                channel: Some(route.channel),
-            };
+            let template = self.relay.matrix_to_mesh(Some(backend.kind()));
             let payload = prefix::fit(
-                &prefix::render(&self.relay.matrix_to_mesh_prefix, &vars),
+                &prefix::render(
+                    template,
+                    &names.vars(&route.network, "", Some(route.channel)),
+                ),
                 &message.body,
                 backend.max_payload(),
             );
@@ -345,14 +391,36 @@ impl Router {
                 now,
             );
 
-            if let Err(error) = backend.send_channel(route.channel, &payload).await {
-                warn!(
+            match backend.send_channel(route.channel, &payload).await {
+                Ok(()) => info!(
+                    room = %message.room_id,
+                    network = %route.network,
+                    channel = route.channel,
+                    sender = %names.name,
+                    "matrix -> mesh"
+                ),
+                Err(error) => warn!(
                     network = %route.network,
                     channel = route.channel,
                     %error,
                     "failed to relay a Matrix message to the mesh"
-                );
+                ),
             }
+        }
+    }
+
+    /// Pick apart what a sender gave us into the three name placeholders.
+    fn names_of(&self, sender: Option<&Sender>) -> Names {
+        Names {
+            name: sender
+                .and_then(|sender| sender.display_name().map(str::to_owned))
+                .unwrap_or_else(|| self.relay.unknown_sender_name.clone()),
+            long: sender
+                .and_then(|sender| sender.long_name.clone())
+                .unwrap_or_default(),
+            short: sender
+                .and_then(|sender| sender.short_name.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -363,11 +431,9 @@ impl Router {
             .and_then(|sender| sender.display_name().map(str::to_owned))
     }
 
-    /// Sender name to put in a prefix, falling back to the configured stand-in
-    /// when the protocol did not carry one.
-    fn sender_name(&self, message: &IncomingMesh) -> String {
-        self.sender_display_name(message)
-            .unwrap_or_else(|| self.relay.unknown_sender_name.clone())
+    /// Which protocol a network speaks, for choosing a per-protocol template.
+    fn kind_of(&self, network: &str) -> Option<MeshKind> {
+        self.backends.get(network).map(|backend| backend.kind())
     }
 }
 
@@ -665,6 +731,100 @@ mod tests {
                 "!room:example.org".to_owned(),
                 "[EA1HYZ 📟/lora]: @[Solo probando] hola buenos días".to_owned()
             )]
+        );
+    }
+
+    /// The reason per-protocol templates exist: `{short}` is a Meshtastic thing,
+    /// and asking for it on a MeshCore channel would leave a hole.
+    #[tokio::test]
+    async fn a_per_protocol_template_wins_over_the_general_one() {
+        let mut config = config(BRIDGED_ROOM);
+        config.relay.mesh_to_matrix_prefix = "[{name}/{network}]: ".to_owned();
+        config.relay.meshtastic_to_matrix_prefix = Some("[{short}/{long}]: ".to_owned());
+
+        let lora = FakeBackend::new("lora", MeshKind::Meshtastic);
+        let mc = FakeBackend::new("mc", MeshKind::MeshCore);
+        let sink = FakeSink::new();
+        let router = Router::build(&config, vec![lora.clone(), mc.clone()], sink.clone())
+            .expect("router builds");
+
+        // Meshtastic: the override, with both names.
+        router
+            .handle_mesh(
+                IncomingMesh {
+                    network: "lora".to_owned(),
+                    origin: Origin::Channel(0),
+                    sender: Some(Sender {
+                        id: Some(PeerId::Node(7)),
+                        long_name: Some("Alice Cooper".to_owned()),
+                        short_name: Some("ALCO".to_owned()),
+                    }),
+                    text: "hola".to_owned(),
+                },
+                Instant::now(),
+            )
+            .await;
+
+        // MeshCore: no override set, so the general template.
+        router
+            .handle_mesh(
+                IncomingMesh {
+                    network: "mc".to_owned(),
+                    origin: Origin::Channel(0),
+                    sender: Some(Sender {
+                        id: None,
+                        long_name: Some("EA1HYZ".to_owned()),
+                        short_name: None,
+                    }),
+                    text: "bos dias".to_owned(),
+                },
+                Instant::now(),
+            )
+            .await;
+
+        let bodies: Vec<String> = sink
+            .sent()
+            .await
+            .into_iter()
+            .map(|(_, body)| body)
+            .collect();
+        assert_eq!(
+            bodies,
+            [
+                "[ALCO/Alice Cooper]: hola".to_owned(),
+                "[EA1HYZ/mc]: bos dias".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_per_protocol_template_applies_to_the_mesh_direction_too() {
+        let mut config = config(BRIDGED_ROOM);
+        config.relay.matrix_to_mesh_prefix = "{name5}[M]: ".to_owned();
+        config.relay.matrix_to_meshcore_prefix = Some("{name}: ".to_owned());
+
+        let lora = FakeBackend::new("lora", MeshKind::Meshtastic);
+        let mc = FakeBackend::new("mc", MeshKind::MeshCore);
+        let sink = FakeSink::new();
+        let router =
+            Router::build(&config, vec![lora.clone(), mc.clone()], sink).expect("router builds");
+
+        router
+            .handle_matrix(
+                MatrixMessage {
+                    room_id: "!room:example.org".to_owned(),
+                    sender: "@roberto:example.org".to_owned(),
+                    body: "hola".to_owned(),
+                },
+                Instant::now(),
+            )
+            .await;
+
+        assert_eq!(lora.sent().await, [(0, "rober[M]: hola".to_owned())]);
+        assert_eq!(
+            mc.sent().await,
+            [(0, "roberto: hola".to_owned())],
+            "MeshCore clients expect a name and a colon, so its template can say so"
         );
     }
 

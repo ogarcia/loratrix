@@ -6,10 +6,17 @@
 //! only identity the receiving client will ever see.
 
 /// Values available to a prefix template.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Vars<'a> {
-    /// Display name of the sender.
+    /// Best name there is: the long one, else the short one, else the configured
+    /// stand-in. The only name placeholder that never comes out blank.
     pub name: &'a str,
+    /// The sender's long name, empty when the protocol did not carry one.
+    pub long: &'a str,
+    /// The sender's short name, empty when the protocol did not carry one, which
+    /// on MeshCore is always. Meshtastic is the one that has both, and having a
+    /// template per protocol is what makes this usable.
+    pub short: &'a str,
     /// Configured network name.
     pub network: &'a str,
     /// Pre-rendered network marker, empty when naming the network would be
@@ -21,11 +28,11 @@ pub struct Vars<'a> {
 
 /// Expand `{placeholder}` occurrences in `template`.
 ///
-/// Supported placeholders: `{name}`, `{network}`, `{network_tag}` and
-/// `{channel}`. `{name}` and `{network}` accept a trailing byte budget, so
-/// `{name5}` yields at most five bytes of the name. An unknown placeholder is
-/// left verbatim rather than silently dropped, so typos are visible instead of
-/// producing anonymous messages.
+/// Supported placeholders: `{name}`, `{long}`, `{short}`, `{network}`,
+/// `{network_tag}` and `{channel}`. All but the last two accept a trailing byte
+/// budget, so `{name5}` yields at most five bytes of the name. An unknown
+/// placeholder is left verbatim rather than silently dropped, so typos are
+/// visible instead of producing anonymous messages.
 pub fn render(template: &str, vars: &Vars<'_>) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
@@ -54,6 +61,8 @@ fn expand(token: &str, vars: &Vars<'_>) -> Option<String> {
     let (key, budget) = split_budget(token);
     let value = match key {
         "name" => vars.name,
+        "long" => vars.long,
+        "short" => vars.short,
         "network" => vars.network,
         "network_tag" => vars.network_tag,
         "channel" => return Some(vars.channel.map_or(String::new(), |ch| ch.to_string())),
@@ -105,7 +114,9 @@ mod tests {
 
     fn vars() -> Vars<'static> {
         Vars {
-            name: "Alice",
+            name: "Alice Cooper",
+            long: "Alice Cooper",
+            short: "ALCO",
             network: "lora-casa",
             network_tag: "[lora-casa]",
             channel: Some(2),
@@ -116,7 +127,7 @@ mod tests {
     fn expands_the_documented_placeholders() {
         assert_eq!(
             render("[{name}/{network}]: ", &vars()),
-            "[Alice/lora-casa]: "
+            "[Alice Cooper/lora-casa]: "
         );
         assert_eq!(render("ch{channel} ", &vars()), "ch2 ");
         assert_eq!(render("[DM]{network_tag} ", &vars()), "[DM][lora-casa] ");
@@ -127,11 +138,36 @@ mod tests {
         assert_eq!(render("{name5}[M]: ", &vars()), "Alice[M]: ");
         assert_eq!(render("{name3}[M]: ", &vars()), "Ali[M]: ");
         assert_eq!(render("{network4}", &vars()), "lora");
+        assert_eq!(render("{short2}", &vars()), "AL");
+    }
+
+    /// What the per-protocol templates exist for: Meshtastic gives a short name
+    /// as well as a long one, and a template can ask for either.
+    #[test]
+    fn expands_the_long_and_short_names_apart() {
+        assert_eq!(
+            render("[{short}/{long}]: ", &vars()),
+            "[ALCO/Alice Cooper]: "
+        );
+    }
+
+    #[test]
+    fn a_name_the_protocol_did_not_carry_renders_empty() {
+        // MeshCore never gives a short name. `{name}` is the one that always has
+        // something in it, which is why it is the one the defaults use.
+        let meshcore = Vars {
+            name: "EA1HYZ",
+            long: "EA1HYZ",
+            short: "",
+            ..vars()
+        };
+        assert_eq!(render("[{short}]", &meshcore), "[]");
+        assert_eq!(render("[{name}]", &meshcore), "[EA1HYZ]");
     }
 
     #[test]
     fn leaves_unknown_placeholders_visible() {
-        assert_eq!(render("{nope}/{name}", &vars()), "{nope}/Alice");
+        assert_eq!(render("{nope}/{name}", &vars()), "{nope}/Alice Cooper");
         assert_eq!(render("{unterminated", &vars()), "{unterminated");
     }
 
