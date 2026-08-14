@@ -38,6 +38,18 @@ added behind the `e2ee` feature without touching the rest.
 cargo build --release
 ```
 
+What ships is a **static musl binary**: one file that brings its own libc and
+needs nothing installed to run, which is the point on a router or an SBC.
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+That comes to about 5.7 MB. Building it needs `cmake` and `musl-tools` on the
+host, because rustls brings aws-lc-rs as its crypto provider and that compiles C
+of its own.
+
 Cargo features:
 
 | Feature      | Default | Effect                                          |
@@ -53,6 +65,23 @@ time. To build only what you use:
 ```sh
 cargo build --release --no-default-features --features meshcore
 ```
+
+## Container
+
+```sh
+podman build -t meshtrix .
+podman run --rm --volume ~/.config/meshtrix:/etc/meshtrix:ro ghcr.io/ogarcia/meshtrix
+```
+
+The image is Alpine with the static binary and a CA store, running as uid 1000,
+and it reads `$MESHTRIX_CONFIG`, which the image points at
+`/etc/meshtrix/config.toml`. BLE is left out of it: the radios are reached over
+TCP, and BLE would drag a C dependency into an image that has no need for one.
+
+CI compiles the binary for amd64 and arm64 and the image build reuses those
+artifacts rather than compiling again, which is what
+`--build-arg BINARY_SOURCE=prebuilt` selects. An ordinary local build compiles in
+the image and needs no `dist/`.
 
 ## Configure
 
@@ -106,7 +135,3 @@ cargo test --all-features
 cargo test --no-default-features --features meshtastic
 cargo test --no-default-features --features meshcore
 ```
-
-## License
-
-GPL-3.0-or-later.

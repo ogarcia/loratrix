@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Óscar García Amor <ogarcia@connectical.com>
+
 name: CI
 
 on:
@@ -5,37 +8,243 @@ on:
     branches: [master]
   pull_request:
 
+# A newer push makes the run before it beside the point.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
+  # What the container image ships, and therefore what the binary job builds.
+  # BLE is out: it would pull btleplug and libdbus-sys, a C dependency a static
+  # build has no reason to carry when the radios are on TCP.
+  FEATURES: meshtastic,meshcore
 
 jobs:
-  lint:
+  check:
+    name: Format, lint and test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+
+      - uses: actions/cache@v6
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-check-${{ hashFiles('Cargo.lock') }}
+          # A changed lock file need not mean starting from nothing: most of what
+          # was compiled last time is still what this time wants.
+          restore-keys: cargo-check-
+
+      # The BLE feature reaches libdbus through btleplug, and --all-features
+      # below turns it on.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev
+
+      # The first two are what the pre-commit hook already refuses to commit
+      # without. The third is the part the hook leaves to us, so that a local
+      # commit stays quick.
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --locked --all-features
 
-  test:
+  features:
+    name: Feature combination (${{ matrix.features }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # A feature combination that is never built is a feature combination
-        # that is broken, so every supported one is exercised here.
+        # A combination that is never built is a combination that is broken, and
+        # the backends are exactly what a user is expected to turn off. The empty
+        # one is not here because it is refused at compile time on purpose.
         features:
-          - --all-features
-          - --no-default-features --features meshtastic
-          - --no-default-features --features meshcore
-          - --no-default-features --features meshtastic,meshcore
+          - meshtastic
+          - meshcore
+          - meshtastic,meshcore
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test ${{ matrix.features }}
-      - run: cargo clippy --workspace --all-targets ${{ matrix.features }} -- -D warnings
+      - uses: actions/checkout@v7
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-features-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-features-
+
+      - run: cargo clippy --workspace --all-targets --no-default-features --features ${{ matrix.features }} -- -D warnings
+      - run: cargo test --workspace --locked --no-default-features --features ${{ matrix.features }}
+
+  binary:
+    name: Static binary (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One architecture failing is worth knowing about on its own.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v7
+
+      # rustls brings aws-lc-rs as its crypto provider, which compiles C of its
+      # own: cmake to drive it, and musl-gcc because the runner's own gcc targets
+      # glibc and the cc crate looks for that one instead. Rust code needs
+      # nothing extra, since the toolchain brings its own musl.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake musl-tools
+
+      - run: rustup target add ${{ matrix.target }}
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.target }}-
+
+      # Static linking is the musl target's own default, so no flag asks for it
+      # here either.
+      - run: cargo build --release --locked --target ${{ matrix.target }} --no-default-features --features $FEATURES
+
+      - name: Check that it brought its own libc
+        run: |
+          binary=target/${{ matrix.target }}/release/meshtrix
+          file "$binary"
+          if readelf -l "$binary" | grep -q INTERP; then
+            echo "meshtrix is not statically linked" >&2
+            exit 1
+          fi
+
+      # Named for the architecture the way the container build says it, which is
+      # what the Containerfile reads and one vocabulary fewer to translate.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: meshtrix-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/meshtrix
+          if-no-files-found: error
+
+  image:
+    name: Container image
+    needs: binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # For pushing to GHCR, which needs nothing else configured: the token the
+      # run already has is the credential.
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: meshtrix-amd64
+          path: amd64
+      - uses: actions/download-artifact@v8
+        with:
+          name: meshtrix-arm64
+          path: arm64
+
+      - name: Lay the binaries out where the Containerfile looks
+        run: |
+          mkdir dist
+          mv amd64/meshtrix dist/meshtrix-amd64
+          mv arm64/meshtrix dist/meshtrix-arm64
+
+      # Emulation is for one thing only: the arm64 image adds its user and its
+      # directories, and that is shell that has to run. No compiler goes near it.
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      # A branch name may carry a slash; an image tag may not.
+      - name: Work out the tag
+        run: echo "TAG=${GITHUB_REF_NAME//\//-}" >> "$GITHUB_ENV"
+
+      # No compiler runs in this job: it wraps the binaries the job before it
+      # made, which is the path a release will take and therefore the one worth
+      # exercising on every push. Loaded rather than pushed, because a
+      # multi-platform image cannot be handed to the local daemon and because
+      # there is nothing to publish until this one has answered.
+      - name: Build for this machine
+        run: |
+          docker buildx build \
+            --build-arg BINARY_SOURCE=prebuilt \
+            --platform linux/amd64 \
+            --load --tag meshtrix:ci .
+
+      # An image that builds and an image that relays messages are different
+      # claims, and the second one cannot be made yet: the mesh backends are
+      # still skeletons. What can be asked is everything up to the radios — that
+      # the entrypoint runs, that it finds the config the image told it about,
+      # and that it agrees with us about what is bridged to what.
+      - name: Start it and ask it something
+        run: |
+          docker run --rm meshtrix:ci --version
+          mkdir -p conf
+          cat > conf/config.toml <<'TOML'
+          [matrix]
+          homeserver = "https://matrix.example.org"
+          user_id = "@relay:example.org"
+          access_token = "ci"
+
+          [[networks]]
+          name = "lora"
+          kind = "meshtastic"
+          transport = { type = "tcp", host = "127.0.0.1" }
+
+          [[networks]]
+          name = "mc"
+          kind = "meshcore"
+          transport = { type = "tcp", host = "127.0.0.1" }
+
+          [[rooms]]
+          id = "!bridge:example.org"
+          routes = [
+            { network = "lora", channel = 0 },
+            { network = "mc", channel = 0 },
+          ]
+
+          [[rooms]]
+          id = "!dm:example.org"
+          dm_inbox = ["lora", "mc"]
+          TOML
+          docker run --rm \
+            --volume "$PWD/conf:/etc/meshtrix:ro" \
+            meshtrix:ci --check | tee plan.txt
+          grep -q 'lora channel 0 \[meshtastic' plan.txt
+          grep -q 'mc channel 0 \[meshcore' plan.txt
+          grep -q 'direct messages (read-only)' plan.txt
+
+      - uses: docker/login-action@v4
+        if: github.event_name == 'push'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Both architectures under one manifest, tagged with the branch it came
+      # from, and only once the amd64 build of it has answered. A pull request
+      # builds and gets tested; it does not publish.
+      - name: Publish
+        if: github.event_name == 'push'
+        run: |
+          docker buildx build \
+            --build-arg BINARY_SOURCE=prebuilt \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --platform linux/amd64,linux/arm64 \
+            --push --tag "ghcr.io/${{ github.repository }}:$TAG" .

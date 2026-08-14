@@ -1,0 +1,8 @@
+# Build context: only Cargo.toml, Cargo.lock, src/ and dist/ are ever copied,
+# but keeping the context small keeps the build quick.
+/target
+/.git
+/.github
+/.githooks
+/meshtastic-matrix-relay
+*.token
