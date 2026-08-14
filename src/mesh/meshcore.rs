@@ -333,6 +333,11 @@ impl MeshCoreBackend {
 /// keep the backend from ever reaching its event loop.
 const MAX_DRAIN: usize = 256;
 
+/// How many channel slots to ask a radio about when listing what it is
+/// subscribed to.
+#[cfg(test)]
+const MAX_CHANNELS: u8 = 8;
+
 #[async_trait]
 impl MeshBackend for MeshCoreBackend {
     fn id(&self) -> &str {
@@ -620,5 +625,112 @@ mod tests {
             backend.client.read().await.is_some(),
             "the backend should still hold a live client"
         );
+    }
+
+    /// The other half of the hardware check: that a message we hand over reaches
+    /// the air. This one **transmits**, on a real mesh, where real people will
+    /// read it, so it stays behind a second gate and does nothing at all unless
+    /// told exactly what to say:
+    ///
+    /// ```sh
+    /// MESHTRIX_MESHCORE_HOST=192.168.1.161 \
+    /// MESHTRIX_MESHCORE_CHANNEL=Galicia \
+    /// MESHTRIX_MESHCORE_SEND="buenos dias" \
+    ///     cargo test --all-features -- --ignored --nocapture sends_to
+    /// ```
+    ///
+    /// Without `MESHTRIX_MESHCORE_SEND` it lists the channels and stops, which is
+    /// how to find out what the radio is subscribed to before saying anything on
+    /// it. Reaching for the channel by name rather than by index is deliberate:
+    /// an index is easy to get wrong and the mistake goes out over the air.
+    #[tokio::test]
+    #[ignore = "transmits on a real mesh; needs MESHTRIX_MESHCORE_HOST and _SEND"]
+    async fn sends_to_a_real_radio() {
+        let Some(host) = std::env::var_os("MESHTRIX_MESHCORE_HOST") else {
+            panic!("set MESHTRIX_MESHCORE_HOST to the address of a companion radio");
+        };
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+        let backend = std::sync::Arc::new(backend(Transport::Tcp {
+            host: host.to_string_lossy().into_owned(),
+            port: None,
+        }));
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let listener = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Some(message) = rx.recv().await {
+                println!("received {message:?}");
+                seen.push(message);
+            }
+            seen
+        });
+
+        // The pump has to keep running throughout: it is what holds the link open
+        // and what would show a reply arriving.
+        let pumping = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.pump(&tx).await }
+        });
+
+        // Wait for the handshake rather than guessing how long it takes.
+        let mut waited = Duration::ZERO;
+        while backend.client.read().await.is_none() {
+            assert!(waited < Duration::from_secs(15), "the radio never came up");
+            sleep(Duration::from_millis(200)).await;
+            waited += Duration::from_millis(200);
+        }
+
+        let channels = {
+            let client = backend.client.read().await;
+            let client = client.as_ref().expect("connected just above");
+            let mut found = Vec::new();
+            for index in 0..MAX_CHANNELS {
+                match client.commands().lock().await.get_channel(index).await {
+                    Ok(info) if !info.name.is_empty() => found.push((index, info.name)),
+                    Ok(_) => {}
+                    Err(error) => {
+                        println!("channel {index} could not be read: {error}");
+                        break;
+                    }
+                }
+            }
+            found
+        };
+        println!("channels: {channels:?}");
+
+        let Ok(text) = std::env::var("MESHTRIX_MESHCORE_SEND") else {
+            println!("MESHTRIX_MESHCORE_SEND is unset, so nothing was transmitted");
+            pumping.abort();
+            return;
+        };
+        let wanted = std::env::var("MESHTRIX_MESHCORE_CHANNEL").unwrap_or_else(|_| "0".to_owned());
+        let channel = channels
+            .iter()
+            .find(|(_, name)| name.eq_ignore_ascii_case(&wanted))
+            .map(|(index, _)| *index)
+            .unwrap_or_else(|| {
+                panic!("no channel named {wanted:?} on this radio; it has {channels:?}")
+            });
+
+        println!("sending {text:?} on channel {channel} ({wanted})");
+        backend
+            .send_channel(channel, &text)
+            .await
+            .expect("the radio should accept the message");
+        println!("the radio accepted it");
+
+        // Long enough for somebody to answer, if anybody is going to.
+        let listen = std::env::var("MESHTRIX_MESHCORE_LISTEN_SECS")
+            .ok()
+            .and_then(|secs| secs.parse().ok())
+            .unwrap_or(60);
+        println!("listening {listen}s for a reply");
+        sleep(Duration::from_secs(listen)).await;
+
+        pumping.abort();
+        let seen = listener.await.expect("the listener does not panic");
+        println!("{} message(s) arrived afterwards", seen.len());
     }
 }
