@@ -557,6 +557,144 @@ mod tests {
         assert!(error.to_string().contains("not implemented yet"), "{error}");
     }
 
+    /// A radio accepts one connection at a time, so there is no way to send this
+    /// backend a message from a phone while it is attached, and catching real
+    /// traffic is a matter of waiting for a stranger. The events are therefore
+    /// built here exactly as the reader emits them, which tests the part that is
+    /// ours: turning the crate's types into the router's.
+    fn channel_event(channel_idx: u8, text: &str) -> meshcore_rs::MeshCoreEvent {
+        meshcore_rs::MeshCoreEvent::new(
+            EventType::ChannelMsgRecv,
+            EventPayload::ChannelMessage(meshcore_rs::ChannelMessage {
+                channel_idx,
+                path_len: 2,
+                txt_type: 0,
+                sender_timestamp: 1_770_000_000,
+                text: text.to_owned(),
+                snr: Some(9.5),
+            }),
+        )
+    }
+
+    fn direct_event(sender_prefix: [u8; 6], text: &str) -> meshcore_rs::MeshCoreEvent {
+        meshcore_rs::MeshCoreEvent::new(
+            EventType::ContactMsgRecv,
+            EventPayload::ContactMessage(meshcore_rs::ContactMessage {
+                sender_prefix,
+                path_len: 0,
+                txt_type: 0,
+                sender_timestamp: 1_770_000_000,
+                text: text.to_owned(),
+                snr: None,
+                signature: None,
+            }),
+        )
+    }
+
+    fn offline_backend() -> MeshCoreBackend {
+        backend(Transport::Tcp {
+            host: "radio".to_owned(),
+            port: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_channel_message_arrives_without_a_sender() {
+        let backend = offline_backend();
+        let message = backend
+            .convert(&channel_event(1, "Alice: bos dias"))
+            .await
+            .expect("a channel message must be relayed");
+
+        assert_eq!(message.network, "mc");
+        assert_eq!(message.origin, Origin::Channel(1));
+        assert!(
+            message.sender.is_none(),
+            "a MeshCore channel carries no identity, and claiming one would be a lie"
+        );
+        assert_eq!(
+            message.text, "Alice: bos dias",
+            "the text is passed through untouched, name convention and all"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_direct_message_arrives_with_its_sender_address() {
+        let backend = offline_backend();
+        let prefix = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01];
+        let message = backend
+            .convert(&direct_event(prefix, "estas ahi?"))
+            .await
+            .expect("a direct message must be relayed");
+
+        assert_eq!(message.origin, Origin::Direct(PeerId::KeyPrefix(prefix)));
+        assert_eq!(message.text, "estas ahi?");
+
+        // Identity is there even with no contact list to put a name to it, which
+        // is what lets the router fall back to the address.
+        let sender = message
+            .sender
+            .expect("a direct message identifies its sender");
+        assert_eq!(sender.id, Some(PeerId::KeyPrefix(prefix)));
+        assert_eq!(sender.display_name(), None);
+    }
+
+    #[tokio::test]
+    async fn a_direct_message_carries_a_known_contact_name() {
+        let backend = offline_backend();
+        let prefix = [1, 2, 3, 4, 5, 6];
+        backend
+            .names
+            .write()
+            .expect("uncontended")
+            .insert(prefix, "Alice".to_owned());
+
+        // Without a live client the lookup cannot reach the radio, so this is the
+        // mirror answering, which is the same path resolve_name uses.
+        assert_eq!(
+            backend.resolve_name(&PeerId::KeyPrefix(prefix)),
+            Some("Alice".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn everything_that_is_not_a_message_is_ignored() {
+        let backend = offline_backend();
+        for event in [
+            meshcore_rs::MeshCoreEvent::new(EventType::Battery, EventPayload::None),
+            meshcore_rs::MeshCoreEvent::new(EventType::Advertisement, EventPayload::None),
+            meshcore_rs::MeshCoreEvent::new(EventType::Disconnected, EventPayload::None),
+        ] {
+            assert!(
+                backend.convert(&event).await.is_none(),
+                "{:?} is not a message",
+                event.event_type
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_contact_refresh_cooldown_holds() {
+        let backend = offline_backend();
+        assert!(
+            backend.may_refresh_names().await,
+            "the first look must be allowed"
+        );
+
+        *backend.names_read_at.lock().await = Some(Instant::now());
+        assert!(
+            !backend.may_refresh_names().await,
+            "a second stranger must not cost a second read of 350 contacts"
+        );
+
+        tokio::time::pause();
+        tokio::time::advance(NAME_REFRESH_COOLDOWN).await;
+        assert!(
+            backend.may_refresh_names().await,
+            "once the cooldown is out, asking again is fine"
+        );
+    }
+
     /// Hardware in the loop, which is the only thing that can answer whether the
     /// handshake and the contact list actually work. Ignored by default because
     /// it needs a radio; point it at one and run it explicitly:
