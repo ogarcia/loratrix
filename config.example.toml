@@ -1,0 +1,68 @@
+# meshtrix example configuration.
+#
+# Copy to ~/.config/meshtrix/config.toml and edit. Unknown keys are rejected, so
+# a typo fails at startup instead of being silently ignored.
+
+[matrix]
+homeserver = "https://matrix.example.org"
+# Full user id of the relay account.
+user_id = "@relay:example.org"
+# Prefer a file over an inline token so the secret is not in this file. The
+# file must contain the token and nothing else.
+access_token_file = "~/.config/meshtrix/token"
+#access_token = "syt_..."
+
+# Optional. Every value below is a default.
+#[relay]
+# How long a relayed message is remembered, to drop duplicates and the relay's
+# own echo coming back off another mesh.
+#dedupe_window_secs = 30
+# Prefix templates. Placeholders: {name}, {network}, {network_tag}, {channel}.
+# A trailing number caps the value in bytes, so {name5} is at most five bytes.
+#mesh_to_matrix_prefix = "[{name}/{network}]: "
+#matrix_to_mesh_prefix = "{name5}[M]: "
+#mesh_to_mesh_prefix = "{name5}[{network4}]: "
+#dm_prefix = "[DM]{network_tag} {name}: "
+# Shown instead of a name when the protocol does not carry one, which is the
+# case for every MeshCore channel message: there the sender's name travels
+# inside the message text by client convention.
+#unknown_sender_name = "unknown"
+
+# One entry per radio. The name is how rooms refer to it, and it appears in
+# prefixes, so keep it short.
+[[networks]]
+name = "lora"
+kind = "meshtastic"
+transport = { type = "tcp", host = "192.168.1.41" }   # port defaults to 4403
+
+[[networks]]
+name = "mc"
+kind = "meshcore"
+transport = { type = "tcp", host = "192.168.1.161" }  # port defaults to 5000
+
+# Other transports:
+#transport = { type = "serial", port = "/dev/ttyACM0" }   # baud defaults to 115200
+#transport = { type = "ble", address = "AA:BB:CC:DD:EE:FF" }  # needs the `ble` feature
+
+# A room with one route is a plain 1:1 bridge between a Matrix room and a mesh
+# channel.
+[[rooms]]
+id = "!general:example.org"
+routes = [{ network = "lora", channel = 0 }]
+
+# A room with several routes also bridges those meshes to each other: a message
+# on lora channel 1 reaches both Matrix and mc channel 1.
+[[rooms]]
+id = "!bridge:example.org"
+routes = [
+  { network = "lora", channel = 1 },
+  { network = "mc", channel = 1 },
+]
+
+# A DM inbox mirrors direct messages sent to the relay's own node. It is
+# read-only: you see them, but nothing written in the room goes back to the
+# mesh. Give it a single network or a list; with a list, each message is tagged
+# with the network it came from.
+[[rooms]]
+id = "!dm:example.org"
+dm_inbox = ["lora", "mc"]

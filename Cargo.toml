@@ -1,0 +1,72 @@
+[package]
+name = "meshtrix"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Minimal relay bridging Meshtastic and MeshCore mesh networks to Matrix rooms"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/ogarcia/meshtrix"
+keywords = ["meshtastic", "meshcore", "matrix", "lora", "relay"]
+categories = ["command-line-utilities"]
+
+[features]
+default = ["meshtastic", "meshcore"]
+# Mesh backends. Either, or both; a build with neither is refused at compile
+# time because it could not relay anything.
+meshtastic = ["dep:meshtastic"]
+meshcore = ["dep:meshcore-rs"]
+# Bluetooth Low Energy transports, delegated to whichever backends are on.
+ble = ["meshtastic?/bluetooth-le", "meshcore-rs?/ble"]
+# Matrix end-to-end encryption. Reserved for the next iteration: it will swap
+# the lean HTTP MatrixSink for a matrix-sdk one. Declared here so the feature
+# surface and CI matrix exist from the start.
+e2ee = []
+
+[dependencies]
+# Async runtime. "signal" is only for graceful shutdown, "net" for the TCP
+# transports; we deliberately do not pull in "fs" or "process".
+tokio = { version = "1", features = [
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
+# Config deserialization and Matrix JSON payloads.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+# Matrix client-server API is plain HTTPS+JSON, so a single HTTP client is all
+# we need. rustls avoids an OpenSSL build dependency, and native-certs means a
+# homeserver behind an internal CA works without extra configuration. Default
+# features are off to keep cookies, gzip and blocking support out of the graph.
+reqwest = { version = "0.13", default-features = false, features = [
+  "json",
+  "rustls",
+  "rustls-native-certs",
+] }
+# One error type for the whole binary. thiserror is not pulled in until we
+# actually need callers to match on error variants.
+anyhow = "1"
+# Structured logging with RUST_LOG filtering.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "ansi",
+  "env-filter",
+  "fmt",
+] }
+# Needed because MeshBackend and MatrixSink are used as trait objects: the
+# number of mesh networks comes from config at runtime, and async fns in traits
+# are not object-safe yet.
+async-trait = "0.1"
+
+# Mesh backends, both optional.
+meshtastic = { version = "0.1", optional = true }
+meshcore-rs = { version = "0.1", optional = true }
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true
