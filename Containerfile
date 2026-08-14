@@ -26,10 +26,10 @@ ARG BINARY_SOURCE=builder
 FROM docker.io/library/rust:${RUST_VERSION}-alpine${ALPINE_VERSION} AS builder
 ARG FEATURES
 
-# gcc and musl-dev come with the base image, without which rustc could not link
-# at all. aws-lc-rs, which rustls brings as its crypto provider, compiles C of
-# its own and wants cmake to do it.
-RUN apk add --no-cache cmake
+# Nothing to install. gcc and musl-dev come with the base image, without which
+# rustc could not link at all, and they are also what aws-lc-sys needs: rustls
+# brings it as its crypto provider and it compiles C of its own, but with cc
+# rather than cmake unless AWS_LC_SYS_CMAKE_BUILDER says otherwise.
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
