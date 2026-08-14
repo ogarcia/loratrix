@@ -220,6 +220,49 @@ impl MeshtasticBackend {
                 self.remember_name(&node);
                 None
             }
+            PayloadVariant::QueueStatus(status) => {
+                // The radio's own answer to a packet we handed it, and the only
+                // one there is: a channel broadcast is never acknowledged by
+                // anybody. `res` of zero means it went into the transmit queue,
+                // and anything else means it did not go anywhere — which is worth
+                // hearing about, since it otherwise looks exactly like silence.
+                if status.res == 0 {
+                    debug!(
+                        network = %self.id,
+                        packet = status.mesh_packet_id,
+                        queue = format_args!("{}/{}", status.free, status.maxlen),
+                        "queued for transmission"
+                    );
+                } else {
+                    warn!(
+                        network = %self.id,
+                        packet = status.mesh_packet_id,
+                        error = status.res,
+                        "the radio refused to queue a packet"
+                    );
+                }
+                None
+            }
+            PayloadVariant::Channel(channel) => {
+                // Worth saying out loud, because a room is mapped to a channel by
+                // index and there is nothing else to check that against. A send to
+                // an index the radio has disabled is accepted and then goes
+                // nowhere, which looks exactly like a working relay.
+                if channel.role != protobufs::channel::Role::Disabled as i32 {
+                    let name = channel
+                        .settings
+                        .as_ref()
+                        .map(|settings| settings.name.clone())
+                        .unwrap_or_default();
+                    info!(
+                        network = %self.id,
+                        channel = channel.index,
+                        name = %name,
+                        "channel available"
+                    );
+                }
+                None
+            }
             PayloadVariant::ConfigCompleteId(_) => {
                 let known = self.names.read().map(|names| names.len()).unwrap_or(0);
                 info!(network = %self.id, nodes = known, "node database loaded");

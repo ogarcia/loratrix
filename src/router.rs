@@ -250,6 +250,7 @@ impl Router {
                 channel,
                 room = %room,
                 sender = %names.name,
+                text = %message.text,
                 "mesh -> matrix"
             ),
             Err(error) => warn!(room = %room, %error, "failed to relay a mesh message to Matrix"),
@@ -294,6 +295,7 @@ impl Router {
                     from = %message.network,
                     network = %route.network,
                     channel = route.channel,
+                    text = %payload,
                     "mesh -> mesh"
                 ),
                 Err(error) => warn!(
@@ -340,10 +342,14 @@ impl Router {
                 message.text
             );
             match self.matrix.send_text(&target.room, &body).await {
+                // Who and where, but not what. A direct message was addressed
+                // to this node and to nobody else, and a log is a place text
+                // outlives the room it was meant for.
                 Ok(()) => info!(
                     network = %message.network,
                     room = %target.room,
                     sender = %names.name,
+                    bytes = message.text.len(),
                     "direct message -> matrix"
                 ),
                 Err(error) => {
@@ -397,6 +403,9 @@ impl Router {
                     network = %route.network,
                     channel = route.channel,
                     sender = %names.name,
+                    // The payload as it went out, prefix and truncation included,
+                    // which is what a mesh client will have seen.
+                    text = %payload,
                     "matrix -> mesh"
                 ),
                 Err(error) => warn!(
