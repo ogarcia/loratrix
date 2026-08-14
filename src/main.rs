@@ -29,6 +29,10 @@ use crate::mesh::MeshBackend;
 use crate::router::Router;
 
 const DEFAULT_CONFIG_PATH: &str = "~/.config/meshtrix/config.toml";
+/// Environment variable naming the config file. This is how the container image
+/// points at a mounted path without every invocation having to repeat
+/// `--config`, which an overridden CMD would otherwise drop.
+const CONFIG_ENV: &str = "MESHTRIX_CONFIG";
 /// Bounded so a burst on one side cannot grow memory without limit.
 const CHANNEL_CAPACITY: usize = 64;
 
@@ -41,7 +45,8 @@ Usage:
   meshtrix --help | --version
 
 Options:
-  -c, --config PATH  Config file (default: ~/.config/meshtrix/config.toml)
+  -c, --config PATH  Config file (default: $MESHTRIX_CONFIG, or
+                     ~/.config/meshtrix/config.toml)
       --check        Validate the config, print the routing plan and exit
   -h, --help         Show this help
   -V, --version      Show the version
@@ -54,7 +59,9 @@ struct Args {
 
 /// Hand-rolled because three flags do not justify an argument parser.
 fn parse_args() -> Result<Option<Args>> {
-    let mut config = PathBuf::from(DEFAULT_CONFIG_PATH);
+    let mut config = std::env::var_os(CONFIG_ENV)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH), PathBuf::from);
     let mut check = false;
     let mut args = std::env::args().skip(1);
 
