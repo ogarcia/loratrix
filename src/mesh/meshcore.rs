@@ -3,11 +3,11 @@
 //! Two things about this protocol shape the code below.
 //!
 //! A **channel** message carries no sender identity at all: only the channel
-//! index, a timestamp and the text. The sender's name travels inside the text by
-//! client convention, so these arrive with `sender: None` and the router decides
-//! what to show. A **direct** message does carry identity, as the first six
-//! bytes of the sender's public key, which is resolved against the contact list
-//! the companion radio keeps.
+//! index, a timestamp and the text. Every client makes up for that by writing
+//! the name into the text itself, as `NAME: MESSAGE`, so that is where the
+//! identity is recovered from — see [`split_sender`]. A **direct** message does
+//! carry identity, as the first six bytes of the sender's public key, which is
+//! resolved against the contact list the companion radio keeps.
 //!
 //! Delivery is pull-based. The radio says `MessagesWaiting` and the host calls
 //! `get_msg` until the queue drains, which `start_auto_message_fetching` does
@@ -47,6 +47,31 @@ const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(60);
 /// of them on the mesh this was written against — so a stranger sending several
 /// messages must not cost one fetch each.
 const NAME_REFRESH_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Longest thing we will believe is a name. The advertised names on the mesh this
+/// was written against run to about twenty five characters; well past that and
+/// the colon was punctuation rather than a separator.
+const MAX_PARSED_NAME: usize = 32;
+
+/// Split the `NAME: MESSAGE` that a MeshCore client puts on the wire.
+///
+/// The protocol gives a channel message no sender, so clients prepend the name to
+/// the text. Recovering it is what lets a MeshCore channel read the same as a
+/// Meshtastic one once it reaches Matrix, rather than carrying a name the relay
+/// has to pretend not to know.
+///
+/// The separator is the **first** `": "`, because that is the one the client
+/// wrote: whatever the sender typed, colons and all, comes after it. A
+/// colon-space rather than a bare colon keeps a URL from being read as a name.
+/// When the shape does not hold — a client that prepends nothing — this gives up
+/// rather than guessing, and the text is passed through whole.
+fn split_sender(text: &str) -> Option<(&str, &str)> {
+    let (name, body) = text.split_once(": ")?;
+    if name.is_empty() || body.is_empty() || name.len() > MAX_PARSED_NAME || name.contains('\n') {
+        return None;
+    }
+    Some((name, body))
+}
 
 /// Where the companion radio is and how to reach it.
 #[derive(Clone, Debug)]
@@ -203,14 +228,30 @@ impl MeshCoreBackend {
     /// Turn an event into something the router understands, or nothing.
     async fn convert(&self, event: &meshcore_rs::MeshCoreEvent) -> Option<IncomingMesh> {
         match &event.payload {
-            // No sender on the wire. The name, if there is one, is inside the
-            // text, so it is passed through untouched.
-            EventPayload::ChannelMessage(message) => Some(IncomingMesh {
-                network: self.id.clone(),
-                origin: Origin::Channel(message.channel_idx),
-                sender: None,
-                text: message.text.clone(),
-            }),
+            // No sender on the wire, so it is dug out of the text, where the
+            // sending client wrote it. What is left is the message as typed.
+            EventPayload::ChannelMessage(message) => {
+                let (sender, text) = match split_sender(&message.text) {
+                    Some((name, body)) => (
+                        Some(Sender {
+                            // A name and nothing else: the protocol gave no
+                            // address to go with it, and inventing one would
+                            // make it look resolvable.
+                            id: None,
+                            long_name: Some(name.to_owned()),
+                            short_name: None,
+                        }),
+                        body.to_owned(),
+                    ),
+                    None => (None, message.text.clone()),
+                };
+                Some(IncomingMesh {
+                    network: self.id.clone(),
+                    origin: Origin::Channel(message.channel_idx),
+                    sender,
+                    text,
+                })
+            }
             EventPayload::ContactMessage(message) => {
                 let prefix = message.sender_prefix;
                 Some(IncomingMesh {
@@ -598,24 +639,82 @@ mod tests {
         })
     }
 
+    /// Word for word what a radio on the Galicia channel actually sent us, in
+    /// answer to a message from this relay.
     #[tokio::test]
-    async fn a_channel_message_arrives_without_a_sender() {
+    async fn a_channel_message_gives_up_its_sender() {
         let backend = offline_backend();
         let message = backend
-            .convert(&channel_event(1, "Alice: bos dias"))
+            .convert(&channel_event(
+                1,
+                "EA1HYZ 📟: @[Solo probando] hola buenos días",
+            ))
             .await
             .expect("a channel message must be relayed");
 
         assert_eq!(message.network, "mc");
         assert_eq!(message.origin, Origin::Channel(1));
+        assert_eq!(
+            message.text, "@[Solo probando] hola buenos días",
+            "the name is lifted out of the text, not left in it twice"
+        );
+
+        let sender = message.sender.expect("the name was there to be found");
+        assert_eq!(sender.display_name(), Some("EA1HYZ 📟"));
+        assert_eq!(
+            sender.id, None,
+            "a name is all the protocol gave; an address would be invented"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_message_without_the_convention_is_left_alone() {
+        let backend = offline_backend();
+        let message = backend
+            .convert(&channel_event(1, "bos dias a todos"))
+            .await
+            .expect("a channel message must be relayed");
+
         assert!(
             message.sender.is_none(),
-            "a MeshCore channel carries no identity, and claiming one would be a lie"
+            "with no name to find, claiming one would be a lie"
         );
+        assert_eq!(message.text, "bos dias a todos");
+    }
+
+    #[test]
+    fn splits_the_name_a_client_wrote_from_the_message_a_person_typed() {
         assert_eq!(
-            message.text, "Alice: bos dias",
-            "the text is passed through untouched, name convention and all"
+            split_sender("EA1HYZ 📟: @[Solo probando] hola"),
+            Some(("EA1HYZ 📟", "@[Solo probando] hola"))
         );
+
+        // The first colon-space is the client's; everything after it was typed,
+        // colons and all.
+        assert_eq!(
+            split_sender("EA1HYZ: mira: esto"),
+            Some(("EA1HYZ", "mira: esto"))
+        );
+
+        // Names on this mesh look like this, and they must survive.
+        assert_eq!(
+            split_sender("LI.CSC P.AMARELA G4/8/O: probando"),
+            Some(("LI.CSC P.AMARELA G4/8/O", "probando"))
+        );
+    }
+
+    #[test]
+    fn refuses_to_read_a_name_that_is_not_there() {
+        // A bare colon is not the separator, so a URL stays whole.
+        assert_eq!(split_sender("http://example.org/x"), None);
+        assert_eq!(split_sender("no separator here"), None);
+        assert_eq!(split_sender(": no name"), None);
+        assert_eq!(split_sender("no message: "), None);
+
+        // Long enough that the colon was punctuation in a sentence rather than a
+        // client writing its name.
+        let sentence = format!("{}: y luego", "palabra ".repeat(6));
+        assert_eq!(split_sender(&sentence), None);
     }
 
     #[tokio::test]

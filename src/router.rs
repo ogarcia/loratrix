@@ -641,6 +641,33 @@ mod tests {
         );
     }
 
+    /// What a real MeshCore channel message ends up looking like in Matrix, once
+    /// the backend has lifted the name out of the text. Word for word what came
+    /// off the Galicia channel.
+    #[tokio::test]
+    async fn a_meshcore_channel_message_reads_like_any_other() {
+        let h = harness(ONE_ROOM);
+        h.router
+            .handle_mesh(
+                from_mesh(
+                    "lora",
+                    0,
+                    Some("EA1HYZ 📟"),
+                    "@[Solo probando] hola buenos días",
+                ),
+                Instant::now(),
+            )
+            .await;
+
+        assert_eq!(
+            h.sink.sent().await,
+            [(
+                "!room:example.org".to_owned(),
+                "[EA1HYZ 📟/lora]: @[Solo probando] hola buenos días".to_owned()
+            )]
+        );
+    }
+
     #[tokio::test]
     async fn uses_the_stand_in_name_when_the_protocol_carries_none() {
         // Every MeshCore channel message arrives without sender identity.

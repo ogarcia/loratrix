@@ -114,11 +114,16 @@ Worth knowing, because it shows up in the output:
 
 - **Meshtastic** packets carry the sender's node number, resolved to a name
   against the radio's node database.
-- **MeshCore** channel messages carry no sender identity at all. The sender's
-  name travels inside the message text by client convention, so the relay shows
-  `unknown_sender_name` in the prefix and leaves the text untouched. MeshCore
-  *direct* messages do carry identity, as a six-byte public-key prefix resolved
-  against the contact list.
+- **MeshCore** channel messages carry no sender identity at all. Every client
+  makes up for that by writing the name into the text, as `NAME: MESSAGE`, so
+  that is where the relay recovers it from — the first `": "` is the one the
+  client wrote, and everything after it was typed by a person. A message that
+  does not follow the convention keeps its text whole and shows
+  `unknown_sender_name` instead. MeshCore *direct* messages do carry identity, as
+  a six-byte public-key prefix resolved against the contact list.
+
+  So `EA1HYZ 📟: hola` on a MeshCore channel reaches Matrix as
+  `[EA1HYZ 📟/mc]: hola`, which is what a Meshtastic message looks like too.
 
 This is also why echo suppression is content-based rather than sender-based.
 
