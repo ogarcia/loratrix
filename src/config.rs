@@ -179,6 +179,17 @@ fn default_serial_baud() -> u32 {
 }
 
 impl Transport {
+    /// Reject a transport that parses but names nowhere to connect to.
+    fn validate(&self, network: &str) -> Result<()> {
+        let missing = match self {
+            Transport::Tcp { host, .. } if host.is_empty() => "a TCP host",
+            Transport::Serial { port, .. } if port.is_empty() => "a serial port",
+            Transport::Ble { address } if address.is_empty() => "a BLE address",
+            _ => return Ok(()),
+        };
+        bail!("network {network:?} is missing {missing}")
+    }
+
     /// TCP port to dial, falling back to the per-protocol default.
     pub fn tcp_port(&self, kind: NetworkKind) -> Option<u16> {
         match self {
@@ -279,6 +290,7 @@ impl Config {
             if !seen_networks.insert(network.name.as_str()) {
                 bail!("duplicate network name {:?}", network.name);
             }
+            network.transport.validate(&network.name)?;
         }
 
         let mut seen_rooms = HashSet::new();
@@ -443,6 +455,22 @@ mod tests {
             error.to_string().contains("duplicate network name"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn rejects_a_transport_with_nowhere_to_connect_to() {
+        for (transport, missing) in [
+            (r#"{ type = "tcp", host = "" }"#, "a TCP host"),
+            (r#"{ type = "serial", port = "" }"#, "a serial port"),
+            (r#"{ type = "ble", address = "" }"#, "a BLE address"),
+        ] {
+            let raw = MINIMAL.replace(
+                r#"transport = { type = "tcp", host = "192.168.1.41" }"#,
+                &format!("transport = {transport}"),
+            );
+            let error = parse(&raw).expect_err("an empty target must be rejected");
+            assert!(error.to_string().contains(missing), "{error}");
+        }
     }
 
     #[test]

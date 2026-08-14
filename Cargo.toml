@@ -70,6 +70,12 @@ meshcore-rs = { version = "0.1", optional = true, default-features = false, feat
   "tcp",
 ] }
 
+[dev-dependencies]
+# tokio::time::pause, so a test can assert that transmissions are paced without
+# spending the interval waiting for it. Dev only: an ordinary build never sees
+# this feature, since dev-dependencies do not take part in it.
+tokio = { version = "1", features = ["test-util"] }
+
 [profile.release]
 codegen-units = 1
 lto = true

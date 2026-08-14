@@ -83,14 +83,9 @@ impl fmt::Display for PeerId {
 
 /// Where a received message came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
-// Tests construct every variant; the production paths that will are the backend
-// packet loops, still to be written.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "variants are constructed by the backend packet loops, still to be written"
-    )
+#[allow(
+    dead_code,
+    reason = "only a backend constructs these, and a build may have none that does yet"
 )]
 pub enum Origin {
     /// A broadcast channel, identified by its index on the radio.
@@ -171,7 +166,7 @@ pub trait MeshBackend: Send + Sync {
     ///
     /// Unused while DM inboxes are read-only, but both protocols support it, so
     /// the trait keeps the door open for an explicit reply syntax later.
-    #[expect(dead_code, reason = "reserved for replying to direct messages")]
+    #[allow(dead_code, reason = "reserved for replying to direct messages")]
     async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<()>;
 
     /// Resolve a peer to a display name from whatever cache the backend keeps.
