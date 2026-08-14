@@ -154,6 +154,51 @@ fn build_backends(config: &Config) -> Result<Vec<Arc<dyn MeshBackend>>> {
     Ok(backends)
 }
 
+/// Resolves when the process is asked to stop.
+///
+/// Ctrl-C is what a person sends. SIGTERM is what an init system sends, and it
+/// has to be listened for explicitly rather than left to the default: inside a
+/// container this process is PID 1, and PID 1 does not get default signal
+/// dispositions, so a SIGTERM with nobody listening is ignored. That is not a
+/// theoretical worry — it means `podman stop` waits its sixty seconds and then
+/// resorts to SIGKILL, every single time.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        match (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+        ) {
+            (Ok(mut interrupt), Ok(mut terminate)) => {
+                tokio::select! {
+                    _ = interrupt.recv() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            (interrupt, terminate) => {
+                // Nothing sensible left to do but keep relaying: exiting here
+                // would turn a broken signal setup into an outage.
+                let error = interrupt.err().or_else(|| terminate.err());
+                error!(
+                    ?error,
+                    "cannot listen for a stop signal; stopping will need SIGKILL"
+                );
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            error!(%error, "cannot listen for ctrl-c; stopping will need killing");
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 async fn relay(
     router: Arc<Router>,
     backends: Vec<Arc<dyn MeshBackend>>,
@@ -182,6 +227,13 @@ async fn relay(
 
     info!("relay started");
 
+    // Created once and held for the whole loop rather than made afresh on each
+    // turn: registering a signal replaces the default disposition, so one
+    // arriving while no listener existed would be swallowed instead of stopping
+    // us.
+    let stop = shutdown_signal();
+    tokio::pin!(stop);
+
     loop {
         tokio::select! {
             Some(message) = mesh_rx.recv() => {
@@ -199,8 +251,7 @@ async fn relay(
                     Err(error) => return Err(error).context("a connection task panicked"),
                 }
             }
-            result = tokio::signal::ctrl_c() => {
-                result.context("waiting for ctrl-c")?;
+            () = &mut stop => {
                 info!("shutting down");
                 return Ok(());
             }
