@@ -100,12 +100,13 @@ jobs:
       - uses: actions/checkout@v7
 
       # rustls brings aws-lc-rs as its crypto provider, which compiles C of its
-      # own: cmake to drive it, and musl-gcc because the runner's own gcc targets
-      # glibc and the cc crate looks for that one instead. Rust code needs
-      # nothing extra, since the toolchain brings its own musl.
+      # own, and musl-gcc is what the cc crate looks for because the runner's own
+      # gcc targets glibc. No cmake: aws-lc-sys drives that compilation with cc
+      # unless AWS_LC_SYS_CMAKE_BUILDER says otherwise. Rust code needs nothing
+      # extra, since the toolchain brings its own musl.
       - run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake musl-tools
+          sudo apt-get install -y --no-install-recommends musl-tools
 
       - run: rustup target add ${{ matrix.target }}
 
@@ -138,6 +139,25 @@ jobs:
           name: meshtrix-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release/meshtrix
           if-no-files-found: error
+
+  image-from-source:
+    name: Container image, compiled in it
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # The README says `podman build -t meshtrix .` works, and nothing else here
+      # would notice if it stopped: the image that gets published is assembled
+      # from the artifacts the binary job made and never enters that stage. One
+      # architecture, loaded and thrown away — what is under test is that it
+      # still compiles and links statically inside Alpine, which is a different
+      # question from whether it does on a runner.
+      - name: Build the compiled-here path
+        run: docker buildx build --platform linux/amd64 --load --tag meshtrix:from-source .
+
+      - run: docker run --rm meshtrix:from-source --version
 
   image:
     name: Container image
