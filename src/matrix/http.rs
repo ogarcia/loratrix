@@ -847,7 +847,9 @@ mod tests {
     #[ignore = "needs a real homeserver; set MESHTRIX_MATRIX_CREDENTIALS"]
     async fn talks_to_a_real_homeserver() {
         let Ok(path) = std::env::var("MESHTRIX_MATRIX_CREDENTIALS") else {
-            panic!("set MESHTRIX_MATRIX_CREDENTIALS to a json file with a token in it");
+            // Skipped rather than failed, the same as the radio checks.
+            println!("MESHTRIX_MATRIX_CREDENTIALS is unset, so there is no homeserver to talk to");
+            return;
         };
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())

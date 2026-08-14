@@ -50,14 +50,9 @@ impl fmt::Display for MeshKind {
 
 /// How a peer is addressed, which is protocol specific.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-// Tests construct every variant; the production paths that will are the backend
-// packet loops, still to be written.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "variants are constructed by the backend packet loops, still to be written"
-    )
+#[allow(
+    dead_code,
+    reason = "each variant belongs to one backend, and a build may not have it"
 )]
 pub enum PeerId {
     /// Meshtastic node number.

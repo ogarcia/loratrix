@@ -10,15 +10,14 @@ carries 42k lines of source and 90-180 MB of RSS to do a job that needs neither.
 
 ## Status
 
-Early, but no longer inert. The routing core, the configuration, the MeshCore
-backend and the Matrix side are implemented and tested; the Meshtastic backend is
-still a skeleton that reports it is not implemented. So a MeshCore mesh can be
-bridged and a Meshtastic one cannot, yet.
+Complete for what it set out to be: both backends and the Matrix side are
+implemented and tested, over TCP and serial. BLE is the one transport still
+missing, and encrypted Matrix rooms the one feature.
 
-Verified against real hardware and a real homeserver: the MeshCore handshake, a
-contact list of 350, a message accepted for transmission, and 80 real Matrix
-events parsed. What has not been seen end to end is a message arriving *from* a
-mesh, for want of anybody sending one while it was watching.
+Verified against real radios and a real homeserver, not only against tests: the
+MeshCore handshake and its 350 contacts, the Meshtastic session and its 200
+nodes, a message sent to a LoRa channel that a stranger answered, that answer
+arriving back and being parsed, and 80 real Matrix events read.
 
 ## What it does
 
@@ -50,9 +49,9 @@ rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-That comes to about 5.7 MB. Building it needs `cmake` and `musl-tools` on the
-host, because rustls brings aws-lc-rs as its crypto provider and that compiles C
-of its own.
+That comes to about 6.4 MB. Building it needs `musl-tools` on the host, because
+rustls brings aws-lc-rs as its crypto provider and that compiles C of its own,
+with `cc` rather than cmake.
 
 Cargo features:
 
@@ -161,4 +160,30 @@ just the default build:
 cargo test --all-features
 cargo test --no-default-features --features meshtastic
 cargo test --no-default-features --features meshcore
+```
+
+### Checks that need hardware
+
+Some things only a radio or a homeserver can answer, so those tests are ignored by
+default and skip themselves when told nothing to talk to. They only listen, and
+cost no airtime:
+
+```sh
+MESHTRIX_MESHCORE_HOST=192.168.1.161 \
+MESHTRIX_MESHTASTIC_HOST=192.168.1.41 \
+MESHTRIX_MATRIX_CREDENTIALS=credentials.json \
+MESHTRIX_MATRIX_ROOMS='!one,!two' \
+  cargo test --all-features -- --ignored --nocapture
+```
+
+`MESHTRIX_MATRIX_HISTORY=6` additionally parses real events the rooms already
+hold, which is what catches a homeserver whose JSON is not the shape we expect.
+
+One test does transmit, and stays quiet unless told exactly what to say — on a
+real mesh, real people read it:
+
+```sh
+MESHTRIX_MESHCORE_HOST=192.168.1.161 MESHTRIX_MESHCORE_CHANNEL=GALICIA \
+MESHTRIX_MESHCORE_SEND='Hello folks' \
+  cargo test --all-features -- --ignored --nocapture sends_to
 ```

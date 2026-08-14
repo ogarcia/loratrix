@@ -806,9 +806,12 @@ mod tests {
     /// It only listens. Nothing is transmitted, so running it costs no airtime.
     #[tokio::test]
     #[ignore = "needs a real MeshCore radio; set MESHTRIX_MESHCORE_HOST"]
-    async fn talks_to_a_real_radio() {
+    async fn talks_to_a_real_meshcore_radio() {
         let Some(host) = std::env::var_os("MESHTRIX_MESHCORE_HOST") else {
-            panic!("set MESHTRIX_MESHCORE_HOST to the address of a companion radio");
+            // Skipped rather than failed: running the ignored tests with only one
+            // kind of radio to hand should not look like a broken relay.
+            println!("MESHTRIX_MESHCORE_HOST is unset, so there is no radio to talk to");
+            return;
         };
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -872,7 +875,7 @@ mod tests {
     /// ```sh
     /// MESHTRIX_MESHCORE_HOST=192.168.1.161 \
     /// MESHTRIX_MESHCORE_CHANNEL=Galicia \
-    /// MESHTRIX_MESHCORE_SEND="buenos dias" \
+    /// MESHTRIX_MESHCORE_SEND="Hello folks" \
     ///     cargo test --all-features -- --ignored --nocapture sends_to
     /// ```
     ///
@@ -882,9 +885,12 @@ mod tests {
     /// an index is easy to get wrong and the mistake goes out over the air.
     #[tokio::test]
     #[ignore = "transmits on a real mesh; needs MESHTRIX_MESHCORE_HOST and _SEND"]
-    async fn sends_to_a_real_radio() {
+    async fn sends_to_a_real_meshcore_radio() {
         let Some(host) = std::env::var_os("MESHTRIX_MESHCORE_HOST") else {
-            panic!("set MESHTRIX_MESHCORE_HOST to the address of a companion radio");
+            // Skipped rather than failed: running the ignored tests with only one
+            // kind of radio to hand should not look like a broken relay.
+            println!("MESHTRIX_MESHCORE_HOST is unset, so there is no radio to talk to");
+            return;
         };
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
