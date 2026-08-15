@@ -799,18 +799,18 @@ mod tests {
     /// it needs a radio; point it at one and run it explicitly:
     ///
     /// ```sh
-    /// MESHTRIX_MESHCORE_HOST=192.168.1.161 cargo test --all-features -- \
+    /// LORATRIX_MESHCORE_HOST=192.168.1.161 cargo test --all-features -- \
     ///     --ignored --nocapture meshcore
     /// ```
     ///
     /// It only listens. Nothing is transmitted, so running it costs no airtime.
     #[tokio::test]
-    #[ignore = "needs a real MeshCore radio; set MESHTRIX_MESHCORE_HOST"]
+    #[ignore = "needs a real MeshCore radio; set LORATRIX_MESHCORE_HOST"]
     async fn talks_to_a_real_meshcore_radio() {
-        let Some(host) = std::env::var_os("MESHTRIX_MESHCORE_HOST") else {
+        let Some(host) = std::env::var_os("LORATRIX_MESHCORE_HOST") else {
             // Skipped rather than failed: running the ignored tests with only one
             // kind of radio to hand should not look like a broken relay.
-            println!("MESHTRIX_MESHCORE_HOST is unset, so there is no radio to talk to");
+            println!("LORATRIX_MESHCORE_HOST is unset, so there is no radio to talk to");
             return;
         };
         let _ = tracing_subscriber::fmt()
@@ -833,9 +833,9 @@ mod tests {
 
         // The pump runs until the link drops, so it is the timeout that ends the
         // test. Reaching it is the success case. Listen for longer with
-        // MESHTRIX_MESHCORE_LISTEN_SECS when the point is to catch real traffic
+        // LORATRIX_MESHCORE_LISTEN_SECS when the point is to catch real traffic
         // rather than just the handshake.
-        let listen = std::env::var("MESHTRIX_MESHCORE_LISTEN_SECS")
+        let listen = std::env::var("LORATRIX_MESHCORE_LISTEN_SECS")
             .ok()
             .and_then(|secs| secs.parse().ok())
             .unwrap_or(20);
@@ -873,23 +873,23 @@ mod tests {
     /// told exactly what to say:
     ///
     /// ```sh
-    /// MESHTRIX_MESHCORE_HOST=192.168.1.161 \
-    /// MESHTRIX_MESHCORE_CHANNEL=Galicia \
-    /// MESHTRIX_MESHCORE_SEND="Hello folks" \
+    /// LORATRIX_MESHCORE_HOST=192.168.1.161 \
+    /// LORATRIX_MESHCORE_CHANNEL=Galicia \
+    /// LORATRIX_MESHCORE_SEND="Hello folks" \
     ///     cargo test --all-features -- --ignored --nocapture sends_to
     /// ```
     ///
-    /// Without `MESHTRIX_MESHCORE_SEND` it lists the channels and stops, which is
+    /// Without `LORATRIX_MESHCORE_SEND` it lists the channels and stops, which is
     /// how to find out what the radio is subscribed to before saying anything on
     /// it. Reaching for the channel by name rather than by index is deliberate:
     /// an index is easy to get wrong and the mistake goes out over the air.
     #[tokio::test]
-    #[ignore = "transmits on a real mesh; needs MESHTRIX_MESHCORE_HOST and _SEND"]
+    #[ignore = "transmits on a real mesh; needs LORATRIX_MESHCORE_HOST and _SEND"]
     async fn sends_to_a_real_meshcore_radio() {
-        let Some(host) = std::env::var_os("MESHTRIX_MESHCORE_HOST") else {
+        let Some(host) = std::env::var_os("LORATRIX_MESHCORE_HOST") else {
             // Skipped rather than failed: running the ignored tests with only one
             // kind of radio to hand should not look like a broken relay.
-            println!("MESHTRIX_MESHCORE_HOST is unset, so there is no radio to talk to");
+            println!("LORATRIX_MESHCORE_HOST is unset, so there is no radio to talk to");
             return;
         };
         let _ = tracing_subscriber::fmt()
@@ -943,12 +943,12 @@ mod tests {
         };
         println!("channels: {channels:?}");
 
-        let Ok(text) = std::env::var("MESHTRIX_MESHCORE_SEND") else {
-            println!("MESHTRIX_MESHCORE_SEND is unset, so nothing was transmitted");
+        let Ok(text) = std::env::var("LORATRIX_MESHCORE_SEND") else {
+            println!("LORATRIX_MESHCORE_SEND is unset, so nothing was transmitted");
             pumping.abort();
             return;
         };
-        let wanted = std::env::var("MESHTRIX_MESHCORE_CHANNEL").unwrap_or_else(|_| "0".to_owned());
+        let wanted = std::env::var("LORATRIX_MESHCORE_CHANNEL").unwrap_or_else(|_| "0".to_owned());
         let channel = channels
             .iter()
             .find(|(_, name)| name.eq_ignore_ascii_case(&wanted))
@@ -965,7 +965,7 @@ mod tests {
         println!("the radio accepted it");
 
         // Long enough for somebody to answer, if anybody is going to.
-        let listen = std::env::var("MESHTRIX_MESHCORE_LISTEN_SECS")
+        let listen = std::env::var("LORATRIX_MESHCORE_LISTEN_SECS")
             .ok()
             .and_then(|secs| secs.parse().ok())
             .unwrap_or(60);

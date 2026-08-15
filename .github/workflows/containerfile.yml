@@ -3,7 +3,7 @@
 
 name: Containerfile
 
-# The README says `podman build -t meshtrix .` works, and nothing in the main
+# The README says `podman build -t loratrix .` works, and nothing in the main
 # workflow would notice if it stopped: the image that gets published there is
 # assembled from prebuilt artifacts and never enters the stage that compiles.
 #
@@ -58,6 +58,6 @@ jobs:
       # still compiles and links statically inside Alpine, which is a different
       # question from whether it does on a runner.
       - name: Build the compiled-here path
-        run: docker buildx build --platform linux/amd64 --load --tag meshtrix:from-source .
+        run: docker buildx build --platform linux/amd64 --load --tag loratrix:from-source .
 
-      - run: docker run --rm meshtrix:from-source --version
+      - run: docker run --rm loratrix:from-source --version

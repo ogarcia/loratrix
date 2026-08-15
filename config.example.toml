@@ -1,6 +1,6 @@
-# meshtrix example configuration.
+# loratrix example configuration.
 #
-# Copy to ~/.config/meshtrix/config.toml and edit. Unknown keys are rejected, so
+# Copy to ~/.config/loratrix/config.toml and edit. Unknown keys are rejected, so
 # a typo fails at startup instead of being silently ignored.
 
 [matrix]
@@ -9,7 +9,7 @@ homeserver = "https://matrix.example.org"
 user_id = "@relay:example.org"
 # Prefer a file over an inline token so the secret is not in this file. The
 # file must contain the token and nothing else.
-access_token_file = "~/.config/meshtrix/token"
+access_token_file = "~/.config/loratrix/token"
 #access_token = "syt_..."
 
 # Optional. Every value below is a default.

@@ -1,4 +1,4 @@
-//! meshtrix — a minimal relay between LoRa mesh networks and Matrix rooms.
+//! loratrix — a minimal relay between LoRa mesh networks and Matrix rooms.
 
 #[cfg(not(any(feature = "meshtastic", feature = "meshcore")))]
 compile_error!(
@@ -28,25 +28,25 @@ use crate::matrix::{MatrixSink, http::HttpSink};
 use crate::mesh::MeshBackend;
 use crate::router::Router;
 
-const DEFAULT_CONFIG_PATH: &str = "~/.config/meshtrix/config.toml";
+const DEFAULT_CONFIG_PATH: &str = "~/.config/loratrix/config.toml";
 /// Environment variable naming the config file. This is how the container image
 /// points at a mounted path without every invocation having to repeat
 /// `--config`, which an overridden CMD would otherwise drop.
-const CONFIG_ENV: &str = "MESHTRIX_CONFIG";
+const CONFIG_ENV: &str = "LORATRIX_CONFIG";
 /// Bounded so a burst on one side cannot grow memory without limit.
 const CHANNEL_CAPACITY: usize = 64;
 
 const USAGE: &str = "\
-meshtrix — relay between Meshtastic/MeshCore meshes and Matrix rooms
+loratrix — relay between Meshtastic/MeshCore meshes and Matrix rooms
 
 Usage:
-  meshtrix [--config PATH]
-  meshtrix --check [--config PATH]
-  meshtrix --help | --version
+  loratrix [--config PATH]
+  loratrix --check [--config PATH]
+  loratrix --help | --version
 
 Options:
-  -c, --config PATH  Config file (default: $MESHTRIX_CONFIG, or
-                     ~/.config/meshtrix/config.toml)
+  -c, --config PATH  Config file (default: $LORATRIX_CONFIG, or
+                     ~/.config/loratrix/config.toml)
       --check        Validate the config, print the routing plan and exit
   -h, --help         Show this help
   -V, --version      Show the version
@@ -72,7 +72,7 @@ fn parse_args() -> Result<Option<Args>> {
                 return Ok(None);
             }
             "-V" | "--version" => {
-                println!("meshtrix {}", env!("CARGO_PKG_VERSION"));
+                println!("loratrix {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
             "--check" => check = true,

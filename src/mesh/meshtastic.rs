@@ -932,18 +932,18 @@ mod tests {
     /// run it explicitly:
     ///
     /// ```sh
-    /// MESHTRIX_MESHTASTIC_HOST=192.168.1.41 cargo test --all-features -- \
+    /// LORATRIX_MESHTASTIC_HOST=192.168.1.41 cargo test --all-features -- \
     ///     --ignored --nocapture meshtastic_radio
     /// ```
     ///
     /// It only listens. Nothing is transmitted, so running it costs no airtime.
     #[tokio::test]
-    #[ignore = "needs a real Meshtastic radio; set MESHTRIX_MESHTASTIC_HOST"]
+    #[ignore = "needs a real Meshtastic radio; set LORATRIX_MESHTASTIC_HOST"]
     async fn talks_to_a_real_meshtastic_radio() {
-        let Some(host) = std::env::var_os("MESHTRIX_MESHTASTIC_HOST") else {
+        let Some(host) = std::env::var_os("LORATRIX_MESHTASTIC_HOST") else {
             // Skipped rather than failed: running the ignored tests with only one
             // kind of radio to hand should not look like a broken relay.
-            println!("MESHTRIX_MESHTASTIC_HOST is unset, so there is no radio to talk to");
+            println!("LORATRIX_MESHTASTIC_HOST is unset, so there is no radio to talk to");
             return;
         };
         let _ = tracing_subscriber::fmt()
@@ -964,7 +964,7 @@ mod tests {
             seen
         });
 
-        let listen = std::env::var("MESHTRIX_MESHTASTIC_LISTEN_SECS")
+        let listen = std::env::var("LORATRIX_MESHTASTIC_LISTEN_SECS")
             .ok()
             .and_then(|secs| secs.parse().ok())
             .unwrap_or(30);

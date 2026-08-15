@@ -125,10 +125,10 @@ jobs:
 
       - name: Check that it brought its own libc
         run: |
-          binary=target/${{ matrix.target }}/release/meshtrix
+          binary=target/${{ matrix.target }}/release/loratrix
           file "$binary"
           if readelf -l "$binary" | grep -q INTERP; then
-            echo "meshtrix is not statically linked" >&2
+            echo "loratrix is not statically linked" >&2
             exit 1
           fi
 
@@ -136,8 +136,8 @@ jobs:
       # what the Containerfile reads and one vocabulary fewer to translate.
       - uses: actions/upload-artifact@v7
         with:
-          name: meshtrix-${{ matrix.arch }}
-          path: target/${{ matrix.target }}/release/meshtrix
+          name: loratrix-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/loratrix
           if-no-files-found: error
 
   image:
@@ -154,18 +154,18 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          name: meshtrix-amd64
+          name: loratrix-amd64
           path: amd64
       - uses: actions/download-artifact@v8
         with:
-          name: meshtrix-arm64
+          name: loratrix-arm64
           path: arm64
 
       - name: Lay the binaries out where the Containerfile looks
         run: |
           mkdir dist
-          mv amd64/meshtrix dist/meshtrix-amd64
-          mv arm64/meshtrix dist/meshtrix-arm64
+          mv amd64/loratrix dist/loratrix-amd64
+          mv arm64/loratrix dist/loratrix-arm64
 
       # Emulation is for one thing only: the arm64 image adds its user and its
       # directories, and that is shell that has to run. No compiler goes near it.
@@ -186,7 +186,7 @@ jobs:
           docker buildx build \
             --build-arg BINARY_SOURCE=prebuilt \
             --platform linux/amd64 \
-            --load --tag meshtrix:ci .
+            --load --tag loratrix:ci .
 
       # An image that builds and an image that relays messages are different
       # claims, and the second one cannot be made yet: the mesh backends are
@@ -195,7 +195,7 @@ jobs:
       # and that it agrees with us about what is bridged to what.
       - name: Start it and ask it something
         run: |
-          docker run --rm meshtrix:ci --version
+          docker run --rm loratrix:ci --version
           mkdir -p conf
           cat > conf/config.toml <<'TOML'
           [matrix]
@@ -225,8 +225,8 @@ jobs:
           dm_inbox = ["lora", "mc"]
           TOML
           docker run --rm \
-            --volume "$PWD/conf:/etc/meshtrix:ro" \
-            meshtrix:ci --check | tee plan.txt
+            --volume "$PWD/conf:/etc/loratrix:ro" \
+            loratrix:ci --check | tee plan.txt
           grep -q 'lora channel 0 \[meshtastic' plan.txt
           grep -q 'mc channel 0 \[meshcore' plan.txt
           grep -q 'direct messages (read-only)' plan.txt

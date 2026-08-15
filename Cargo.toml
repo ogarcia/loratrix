@@ -1,11 +1,11 @@
 [package]
-name = "meshtrix"
+name = "loratrix"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Minimal relay bridging Meshtastic and MeshCore mesh networks to Matrix rooms"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/ogarcia/meshtrix"
+repository = "https://github.com/ogarcia/loratrix"
 keywords = ["meshtastic", "meshcore", "matrix", "lora", "relay"]
 categories = ["command-line-utilities"]
 

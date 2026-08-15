@@ -5,7 +5,7 @@
 # beside it because this is the only place the build itself can read, which is
 # what lets the obvious thing work:
 #
-#   podman build -t meshtrix .
+#   podman build -t loratrix .
 #
 # Both name a minor line rather than a patch, so fixes arrive without a commit,
 # the same bargain the dependencies are on.
@@ -52,9 +52,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     set -eux; \
     cargo build --release --locked --no-default-features --features "${FEATURES}"; \
-    install -D target/release/meshtrix /out/meshtrix; \
-    if readelf -l /out/meshtrix | grep -q INTERP; then \
-        echo "meshtrix is not statically linked" >&2; \
+    install -D target/release/loratrix /out/loratrix; \
+    if readelf -l /out/loratrix | grep -q INTERP; then \
+        echo "loratrix is not statically linked" >&2; \
         exit 1; \
     fi
 
@@ -64,7 +64,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # repeating that work inside a container image would be slower and would prove
 # nothing. Point the build at what it already made, under dist/:
 #
-#   podman build --build-arg BINARY_SOURCE=prebuilt -t meshtrix .
+#   podman build --build-arg BINARY_SOURCE=prebuilt -t loratrix .
 #
 # Only the stage that gets used is assembled, so dist/ need not exist for an
 # ordinary build from source.
@@ -75,7 +75,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # emulator has to run is the last stage's handful of shell.
 FROM scratch AS prebuilt
 ARG TARGETARCH
-COPY dist/meshtrix-${TARGETARCH} /out/meshtrix
+COPY dist/loratrix-${TARGETARCH} /out/loratrix
 
 # --- whichever of those two it was -------------------------------------------
 
@@ -88,9 +88,9 @@ FROM ${BINARY_SOURCE} AS binary
 
 FROM docker.io/library/alpine:${ALPINE_VERSION}
 
-LABEL org.opencontainers.image.title="meshtrix" \
+LABEL org.opencontainers.image.title="loratrix" \
       org.opencontainers.image.description="Relay between Meshtastic/MeshCore meshes and Matrix rooms" \
-      org.opencontainers.image.source="https://github.com/ogarcia/meshtrix" \
+      org.opencontainers.image.source="https://github.com/ogarcia/loratrix" \
       org.opencontainers.image.licenses="GPL-3.0-or-later"
 
 # The binary brings its own libc but not its own idea of who to trust. rustls
@@ -102,19 +102,19 @@ RUN apk add --no-cache ca-certificates
 # The mode is set rather than inherited because a binary that has travelled
 # through a CI artifact arrives without its executable bit: zip does not carry
 # permissions.
-COPY --from=binary --chmod=0755 /out/meshtrix /usr/local/bin/meshtrix
+COPY --from=binary --chmod=0755 /out/loratrix /usr/local/bin/loratrix
 
 # Never root. The id is 1000 because that is the first one a Linux desktop hands
 # out, so a bind mounted config usually belongs to it already; anything else is
 # what --user is for.
-RUN addgroup -g 1000 meshtrix \
- && adduser -D -H -G meshtrix -u 1000 meshtrix \
- && mkdir -p /etc/meshtrix
+RUN addgroup -g 1000 loratrix \
+ && adduser -D -H -G loratrix -u 1000 loratrix \
+ && mkdir -p /etc/loratrix
 
 # Named in the environment rather than appended to the entrypoint, because any
 # argument given to `podman run` replaces CMD wholesale and would take the path
 # with it. This way `--check` and `--version` work without repeating it.
-ENV MESHTRIX_CONFIG=/etc/meshtrix/config.toml
+ENV LORATRIX_CONFIG=/etc/loratrix/config.toml
 
 # No EXPOSE: the relay dials out to the radios and to the homeserver and listens
 # on nothing. Nor a VOLUME, since the only thing to mount is a config file the
@@ -124,5 +124,5 @@ ENV MESHTRIX_CONFIG=/etc/meshtrix/config.toml
 # for a relay whose radio has gone quiet is a question with more than one right
 # answer.
 
-USER meshtrix
-ENTRYPOINT ["/usr/local/bin/meshtrix"]
+USER loratrix
+ENTRYPOINT ["/usr/local/bin/loratrix"]

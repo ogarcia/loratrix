@@ -850,6 +850,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "loratrix"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "meshcore-rs",
+ "meshtastic",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -916,23 +933,6 @@ dependencies = [
  "tokio-serial",
  "tokio-util",
  "uuid",
-]
-
-[[package]]
-name = "meshtrix"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "meshcore-rs",
- "meshtastic",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

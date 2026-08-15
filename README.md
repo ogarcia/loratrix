@@ -1,4 +1,4 @@
-# meshtrix
+# loratrix
 
 A minimal relay between LoRa mesh networks and Matrix rooms. It bridges
 **Meshtastic** and **MeshCore** — either one, or both at the same time — and
@@ -72,13 +72,13 @@ cargo build --release --no-default-features --features meshcore
 ## Container
 
 ```sh
-podman build -t meshtrix .
-podman run --rm --volume ~/.config/meshtrix:/etc/meshtrix:ro ghcr.io/ogarcia/meshtrix
+podman build -t loratrix .
+podman run --rm --volume ~/.config/loratrix:/etc/loratrix:ro ghcr.io/ogarcia/loratrix
 ```
 
 The image is Alpine with the static binary and a CA store, running as uid 1000,
-and it reads `$MESHTRIX_CONFIG`, which the image points at
-`/etc/meshtrix/config.toml`. BLE is left out of it: the radios are reached over
+and it reads `$LORATRIX_CONFIG`, which the image points at
+`/etc/loratrix/config.toml`. BLE is left out of it: the radios are reached over
 TCP, and BLE would drag a C dependency into an image that has no need for one.
 
 CI compiles the binary for amd64 and arm64 and the image build reuses those
@@ -88,11 +88,11 @@ the image and needs no `dist/`.
 
 ## Configure
 
-Copy `config.example.toml` to `~/.config/meshtrix/config.toml` and edit it. Then
+Copy `config.example.toml` to `~/.config/loratrix/config.toml` and edit it. Then
 check what the relay understood before starting it:
 
 ```sh
-meshtrix --check
+loratrix --check
 ```
 
 ```text
@@ -105,7 +105,7 @@ room !dm:example.org <-- lora direct messages (read-only)
 room !dm:example.org <-- mc direct messages (read-only)
 ```
 
-Logging follows `RUST_LOG`, for example `RUST_LOG=meshtrix=debug`.
+Logging follows `RUST_LOG`, for example `RUST_LOG=loratrix=debug`.
 
 ## The two protocols are not symmetric
 
@@ -196,21 +196,21 @@ default and skip themselves when told nothing to talk to. They only listen, and
 cost no airtime:
 
 ```sh
-MESHTRIX_MESHCORE_HOST=192.168.1.161 \
-MESHTRIX_MESHTASTIC_HOST=192.168.1.41 \
-MESHTRIX_MATRIX_CREDENTIALS=credentials.json \
-MESHTRIX_MATRIX_ROOMS='!one,!two' \
+LORATRIX_MESHCORE_HOST=192.168.1.161 \
+LORATRIX_MESHTASTIC_HOST=192.168.1.41 \
+LORATRIX_MATRIX_CREDENTIALS=credentials.json \
+LORATRIX_MATRIX_ROOMS='!one,!two' \
   cargo test --all-features -- --ignored --nocapture
 ```
 
-`MESHTRIX_MATRIX_HISTORY=6` additionally parses real events the rooms already
+`LORATRIX_MATRIX_HISTORY=6` additionally parses real events the rooms already
 hold, which is what catches a homeserver whose JSON is not the shape we expect.
 
 One test does transmit, and stays quiet unless told exactly what to say — on a
 real mesh, real people read it:
 
 ```sh
-MESHTRIX_MESHCORE_HOST=192.168.1.161 MESHTRIX_MESHCORE_CHANNEL=GALICIA \
-MESHTRIX_MESHCORE_SEND='Hello folks' \
+LORATRIX_MESHCORE_HOST=192.168.1.161 LORATRIX_MESHCORE_CHANNEL=GALICIA \
+LORATRIX_MESHCORE_SEND='Hello folks' \
   cargo test --all-features -- --ignored --nocapture sends_to
 ```

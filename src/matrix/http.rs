@@ -86,7 +86,7 @@ impl HttpSink {
 
         Ok(Self {
             client: reqwest::Client::builder()
-                .user_agent(concat!("meshtrix/", env!("CARGO_PKG_VERSION")))
+                .user_agent(concat!("loratrix/", env!("CARGO_PKG_VERSION")))
                 .timeout(REQUEST_TIMEOUT)
                 .build()
                 .context("building the HTTP client")?,
@@ -103,7 +103,7 @@ impl HttpSink {
 
     fn next_txn_id(&self) -> String {
         let counter = self.txn_counter.fetch_add(1, Ordering::Relaxed);
-        format!("meshtrix-{}-{counter}", self.txn_epoch)
+        format!("loratrix-{}-{counter}", self.txn_epoch)
     }
 
     /// The sync filter: only the bridged rooms, only messages, and none of the
@@ -842,18 +842,18 @@ mod tests {
     /// point it at some and run it explicitly:
     ///
     /// ```sh
-    /// MESHTRIX_MATRIX_CREDENTIALS=/tmp/credentials.json \
-    /// MESHTRIX_MATRIX_ROOMS='!one,!two' \
+    /// LORATRIX_MATRIX_CREDENTIALS=/tmp/credentials.json \
+    /// LORATRIX_MATRIX_ROOMS='!one,!two' \
     ///     cargo test --all-features -- --ignored --nocapture real_homeserver
     /// ```
     ///
     /// It joins and listens. Nothing is sent, so no room sees anything.
     #[tokio::test]
-    #[ignore = "needs a real homeserver; set MESHTRIX_MATRIX_CREDENTIALS"]
+    #[ignore = "needs a real homeserver; set LORATRIX_MATRIX_CREDENTIALS"]
     async fn talks_to_a_real_homeserver() {
-        let Ok(path) = std::env::var("MESHTRIX_MATRIX_CREDENTIALS") else {
+        let Ok(path) = std::env::var("LORATRIX_MATRIX_CREDENTIALS") else {
             // Skipped rather than failed, the same as the radio checks.
-            println!("MESHTRIX_MATRIX_CREDENTIALS is unset, so there is no homeserver to talk to");
+            println!("LORATRIX_MATRIX_CREDENTIALS is unset, so there is no homeserver to talk to");
             return;
         };
         let _ = tracing_subscriber::fmt()
@@ -879,7 +879,7 @@ mod tests {
         })
         .expect("a valid config");
 
-        let rooms: Vec<String> = std::env::var("MESHTRIX_MATRIX_ROOMS")
+        let rooms: Vec<String> = std::env::var("LORATRIX_MATRIX_ROOMS")
             .unwrap_or_default()
             .split(',')
             .filter(|room| !room.is_empty())
@@ -887,7 +887,7 @@ mod tests {
             .collect();
         assert!(
             !rooms.is_empty(),
-            "set MESHTRIX_MATRIX_ROOMS to a comma separated list of rooms"
+            "set LORATRIX_MATRIX_ROOMS to a comma separated list of rooms"
         );
 
         sink.join_rooms(&rooms)
@@ -898,7 +898,7 @@ mod tests {
         // stream works; this is what proves we read what a homeserver actually
         // sends, without waiting for somebody to say something. Still read-only:
         // history is what the room already holds.
-        if let Some(history) = std::env::var("MESHTRIX_MATRIX_HISTORY")
+        if let Some(history) = std::env::var("LORATRIX_MATRIX_HISTORY")
             .ok()
             .and_then(|count| count.parse().ok())
         {
@@ -933,7 +933,7 @@ mod tests {
         }
 
         let (tx, mut rx) = mpsc::channel(32);
-        let listen: u64 = std::env::var("MESHTRIX_MATRIX_LISTEN_SECS")
+        let listen: u64 = std::env::var("LORATRIX_MATRIX_LISTEN_SECS")
             .ok()
             .and_then(|secs| secs.parse().ok())
             .unwrap_or(30);
