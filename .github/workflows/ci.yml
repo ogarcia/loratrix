@@ -229,7 +229,7 @@ jobs:
             loratrix:ci --check | tee plan.txt
           grep -q 'lora channel 0 \[meshtastic' plan.txt
           grep -q 'mc channel 0 \[meshcore' plan.txt
-          grep -q 'direct messages (read-only)' plan.txt
+          grep -q 'direct messages (reply to one to answer it)' plan.txt
 
       - uses: docker/login-action@v4
         if: github.event_name == 'push'

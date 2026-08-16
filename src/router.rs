@@ -2302,4 +2302,16 @@ mod tests {
         assert!(plan.contains("lora channel 0"), "{plan}");
         assert!(plan.contains("mc channel 0"), "{plan}");
     }
+
+    /// The exact wording, because CI greps the running image for it. Changing
+    /// what a DM inbox is called should fail here rather than three steps into
+    /// a container build.
+    #[test]
+    fn the_plan_says_what_a_dm_inbox_does() {
+        let plan = harness(DM_ROOMS).router.plan();
+        assert!(
+            plan.contains("lora direct messages (reply to one to answer it)"),
+            "{plan}"
+        );
+    }
 }
