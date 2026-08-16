@@ -12,24 +12,25 @@
 //! either can be told apart.
 
 use std::collections::HashMap;
-use std::sync::RwLock as SyncRwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex as SyncMutex, RwLock as SyncRwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use meshtastic::Message as _;
 use meshtastic::api::{ConnectedStreamApi, StreamApi};
 use meshtastic::packet::PacketReceiver;
 use meshtastic::protobufs;
 use meshtastic::types::MeshChannel;
 use meshtastic::utils;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{Instant, sleep, sleep_until};
 use tracing::{debug, info, trace, warn};
 
 use crate::config::{NetworkConfig, NetworkKind, Transport};
 use crate::mesh::{
-    IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin, PeerId, Sender,
+    Delivery, IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin, PeerId, Sender,
 };
 
 /// Every node, rather than one of them. Meshtastic has no constant for it.
@@ -54,6 +55,11 @@ const DEFAULT_HOP_LIMIT: u32 = 3;
 /// The protocol's ceiling. The firmware ignores anything above it and falls back to
 /// the default, so a radio reporting more than this is reporting nonsense.
 const MAX_HOP_LIMIT: u32 = 7;
+
+/// How long to wait for a direct message to be acknowledged before calling it
+/// lost. Meshtastic offers no per-message figure the way MeshCore does; this is
+/// the firmware's own retransmission budget, after which nothing more is coming.
+const ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Firmware refuses to transmit faster than this, so it is a floor rather than a
 /// preference.
@@ -102,6 +108,10 @@ pub struct MeshtasticBackend {
     api: Mutex<Option<ConnectedStreamApi>>,
     /// Earliest instant at which the next transmission may go out.
     next_send: Mutex<Option<Instant>>,
+    /// Direct messages waiting to be acknowledged, by the packet id they went out
+    /// under. The acknowledgement arrives over the air, through the receive loop,
+    /// long after the send returned.
+    awaiting_ack: SyncMutex<HashMap<u32, oneshot::Sender<bool>>>,
 }
 
 impl MeshtasticBackend {
@@ -140,6 +150,7 @@ impl MeshtasticBackend {
             hop_limit: AtomicU32::new(DEFAULT_HOP_LIMIT),
             api: Mutex::new(None),
             next_send: Mutex::new(None),
+            awaiting_ack: SyncMutex::new(HashMap::new()),
         })
     }
 
@@ -310,6 +321,13 @@ impl MeshtasticBackend {
             }
         };
 
+        // The answer to a direct message of ours, which the mesh sends back as
+        // its own packet naming the one it answers.
+        if data.portnum == protobufs::PortNum::RoutingApp as i32 {
+            self.settle(&data);
+            return None;
+        }
+
         if data.portnum != protobufs::PortNum::TextMessageApp as i32 {
             trace!(network = %self.id, portnum = data.portnum, "not a text message");
             return None;
@@ -347,6 +365,60 @@ impl MeshtasticBackend {
             // "unset", and a packet without an id is one nothing can point at.
             reference: (packet.id != 0).then_some(MessageRef::Packet(packet.id)),
         })
+    }
+
+    /// Resolve a direct message of ours that the mesh has answered.
+    ///
+    /// A routing packet names the message it is about in `request_id`. An empty
+    /// error reason is the acknowledgement; anything else is the mesh saying it
+    /// could not deliver, which is worth reporting straight away rather than
+    /// making the caller wait out its timeout.
+    fn settle(&self, data: &protobufs::Data) {
+        if data.request_id == 0 {
+            return;
+        }
+        let Some(waiting) = self.forget_ack(data.request_id) else {
+            // Somebody else's routing traffic, or ours after we stopped caring.
+            trace!(network = %self.id, packet = data.request_id, "an ack we were not waiting for");
+            return;
+        };
+
+        let reason = match protobufs::Routing::decode(&data.payload[..]) {
+            Ok(routing) => match routing.variant {
+                Some(protobufs::routing::Variant::ErrorReason(reason)) => reason,
+                // A route request or reply says nothing about delivery.
+                _ => return,
+            },
+            Err(error) => {
+                debug!(network = %self.id, %error, "a routing packet we could not read");
+                return;
+            }
+        };
+
+        let delivered = reason == protobufs::routing::Error::None as i32;
+        if delivered {
+            debug!(network = %self.id, packet = data.request_id, "acknowledged");
+        } else {
+            debug!(
+                network = %self.id,
+                packet = data.request_id,
+                reason,
+                "the mesh could not deliver it"
+            );
+        }
+        // Nobody left to tell is not a problem: the waiter timed out and moved on.
+        let _ = waiting.send(delivered);
+    }
+
+    /// Take the waiter for a packet, if there is one.
+    fn forget_ack(&self, packet: u32) -> Option<oneshot::Sender<bool>> {
+        match self.awaiting_ack.lock() {
+            Ok(mut waiting) => waiting.remove(&packet),
+            Err(_) => {
+                warn!(network = %self.id, "the pending-ack lock is poisoned");
+                None
+            }
+        }
     }
 
     /// What we know about a node, which may be no more than its number.
@@ -388,6 +460,16 @@ impl MeshtasticBackend {
             Err(_) => warn!(network = %self.id, "the name cache lock is poisoned"),
         }
         self.hop_limit.store(DEFAULT_HOP_LIMIT, Ordering::Relaxed);
+        // Anything that was in flight when the link went is not going to be
+        // acknowledged now. Dropping the waiters closes their channels, which
+        // tells whoever is waiting straight away rather than at the timeout.
+        if let Ok(mut waiting) = self.awaiting_ack.lock() {
+            let abandoned = waiting.len();
+            if abandoned > 0 {
+                debug!(network = %self.id, abandoned, "direct messages left unacknowledged");
+            }
+            waiting.clear();
+        }
     }
 
     /// Take the hop limit from the radio's LoRa config, if it is one the protocol
@@ -427,6 +509,7 @@ impl MeshtasticBackend {
         channel: MeshChannel,
         text: &str,
         reply_to: Option<&MessageRef>,
+        want_ack: bool,
     ) -> protobufs::MeshPacket {
         protobufs::MeshPacket {
             payload_variant: Some(protobufs::mesh_packet::PayloadVariant::Decoded(
@@ -452,10 +535,11 @@ impl MeshtasticBackend {
             id: utils::generate_rand_id(),
             channel: channel.channel(),
             hop_limit: self.hop_limit.load(Ordering::Relaxed),
-            // No acknowledgement asked for: a broadcast cannot be acknowledged in
-            // any useful way, and for a direct message the answer would arrive long
-            // after the relay had stopped caring.
-            want_ack: false,
+            // Asked for on a direct message, where one node is expected to answer
+            // and the answer means something. Never on a broadcast: there is no
+            // single node it would come from, and asking would have every hearer
+            // reply.
+            want_ack,
             // What the reference client sends for a message a person typed. Left
             // unset the firmware picks for us, and picks lower.
             priority: protobufs::mesh_packet::Priority::Reliable as i32,
@@ -471,6 +555,7 @@ impl MeshtasticBackend {
         channel: u8,
         text: &str,
         reply_to: Option<MessageRef>,
+        want_ack: bool,
     ) -> Result<MessageRef> {
         let channel = MeshChannel::new(u32::from(channel)).map_err(|error| {
             anyhow::anyhow!("channel {channel} is not one a radio has: {error}")
@@ -484,7 +569,7 @@ impl MeshtasticBackend {
             None => bail!("network {:?} is not connected", self.id),
         };
 
-        let packet = self.outgoing(to, channel, text, reply_to.as_ref());
+        let packet = self.outgoing(to, channel, text, reply_to.as_ref(), want_ack);
         let id = MessageRef::Packet(packet.id);
         // Logged before sending, and with the packet id, because that is what the
         // radio's queue report comes back naming.
@@ -551,18 +636,36 @@ impl MeshBackend for MeshtasticBackend {
         text: &str,
         reply_to: Option<MessageRef>,
     ) -> Result<Option<MessageRef>> {
-        self.transmit(BROADCAST_ADDR, channel, text, reply_to)
+        self.transmit(BROADCAST_ADDR, channel, text, reply_to, false)
             .await
             .map(Some)
     }
 
-    async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<()> {
+    async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<Delivery> {
         let PeerId::Node(num) = peer else {
             bail!("{peer} is not a Meshtastic address");
         };
         // The primary channel, which is where a direct message goes: the address
         // is what makes it private, not the channel.
-        self.transmit(*num, 0, text, None).await.map(|_| ())
+        let sent = self.transmit(*num, 0, text, None, true).await?;
+        let MessageRef::Packet(id) = sent else {
+            unreachable!("this backend only ever sends packets");
+        };
+
+        // Registered after the send rather than before, because an acknowledgement
+        // cannot arrive for a packet the radio was never given, and a send that
+        // failed would otherwise leave an entry nothing will ever resolve.
+        let (tx, ack) = oneshot::channel();
+        match self.awaiting_ack.lock() {
+            Ok(mut waiting) => {
+                waiting.insert(id, tx);
+            }
+            Err(_) => warn!(network = %self.id, "the pending-ack lock is poisoned"),
+        }
+        Ok(Delivery {
+            ack,
+            within: ACK_TIMEOUT,
+        })
     }
 
     fn resolve_name(&self, peer: &PeerId) -> Option<String> {
@@ -615,6 +718,121 @@ mod tests {
             )),
             ..Default::default()
         }
+    }
+
+    /// What the mesh sends back about a direct message of ours: a routing packet
+    /// naming the one it answers, carrying a reason of zero for success.
+    fn routing_packet(about: u32, reason: protobufs::routing::Error) -> protobufs::MeshPacket {
+        let routing = protobufs::Routing {
+            variant: Some(protobufs::routing::Variant::ErrorReason(reason as i32)),
+        };
+        protobufs::MeshPacket {
+            from: 9,
+            to: 42,
+            payload_variant: Some(protobufs::mesh_packet::PayloadVariant::Decoded(
+                protobufs::Data {
+                    portnum: protobufs::PortNum::RoutingApp as i32,
+                    payload: routing.encode_to_vec(),
+                    request_id: about,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// Put a waiter in the table by hand, since sending one needs a radio.
+    fn expecting_ack(backend: &MeshtasticBackend, packet: u32) -> oneshot::Receiver<bool> {
+        let (tx, rx) = oneshot::channel();
+        backend
+            .awaiting_ack
+            .lock()
+            .expect("a fresh lock")
+            .insert(packet, tx);
+        rx
+    }
+
+    #[test]
+    fn an_acknowledgement_settles_the_message_it_names() {
+        let backend = offline_backend();
+        let mut waiting = expecting_ack(&backend, 7);
+
+        assert!(
+            backend
+                .message(routing_packet(7, protobufs::routing::Error::None))
+                .is_none(),
+            "routing traffic is not something to relay"
+        );
+        assert_eq!(
+            waiting.try_recv(),
+            Ok(true),
+            "an empty error reason is the acknowledgement"
+        );
+    }
+
+    #[test]
+    fn a_failure_to_deliver_settles_it_too() {
+        let backend = offline_backend();
+        let mut waiting = expecting_ack(&backend, 7);
+
+        backend.message(routing_packet(7, protobufs::routing::Error::NoRoute));
+        assert_eq!(
+            waiting.try_recv(),
+            Ok(false),
+            "knowing it failed beats waiting out the timeout"
+        );
+    }
+
+    #[test]
+    fn an_acknowledgement_for_something_else_is_left_alone() {
+        let backend = offline_backend();
+        let mut waiting = expecting_ack(&backend, 7);
+
+        backend.message(routing_packet(999, protobufs::routing::Error::None));
+        assert_eq!(
+            waiting.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty),
+            "another node's routing traffic must not settle ours"
+        );
+    }
+
+    /// A link that drops takes every answer still in flight with it, and saying
+    /// so at once beats leaving the waiter to time out.
+    #[test]
+    fn a_reconnect_abandons_what_was_in_flight() {
+        let backend = offline_backend();
+        let mut waiting = expecting_ack(&backend, 7);
+
+        backend.forget_radio();
+        assert_eq!(
+            waiting.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        );
+    }
+
+    #[test]
+    fn a_direct_message_asks_to_be_acknowledged() {
+        let backend = offline_backend();
+        let direct = backend.outgoing(
+            9,
+            MeshChannel::new(0).expect("channel nought"),
+            "hola",
+            None,
+            true,
+        );
+        assert!(direct.want_ack, "nobody would answer otherwise");
+
+        let broadcast = backend.outgoing(
+            BROADCAST_ADDR,
+            MeshChannel::new(0).expect("channel nought"),
+            "hola",
+            None,
+            false,
+        );
+        assert!(
+            !broadcast.want_ack,
+            "asking a whole channel to answer would flood it"
+        );
     }
 
     fn node_info(num: u32, long: &str, short: &str) -> protobufs::NodeInfo {
@@ -841,6 +1059,7 @@ mod tests {
             MeshChannel::new(0).expect("channel nought"),
             "bos dias",
             None,
+            false,
         );
         assert_ne!(
             packet.hop_limit, 0,
@@ -859,6 +1078,7 @@ mod tests {
             MeshChannel::new(0).expect("channel nought"),
             "bos dias",
             None,
+            false,
         );
         assert_eq!(packet.hop_limit, 5);
     }
@@ -888,7 +1108,13 @@ mod tests {
         let backend = offline_backend();
         backend.my_node_num.store(42, Ordering::Relaxed);
 
-        let packet = backend.outgoing(9, MeshChannel::new(3).expect("channel three"), "hola", None);
+        let packet = backend.outgoing(
+            9,
+            MeshChannel::new(3).expect("channel three"),
+            "hola",
+            None,
+            false,
+        );
 
         assert_eq!(packet.from, 42);
         assert_eq!(packet.to, 9);

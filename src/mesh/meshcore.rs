@@ -15,19 +15,19 @@
 //! because that announcement has already been and gone.
 
 use std::collections::HashMap;
-use std::sync::RwLock as SyncRwLock;
+use std::sync::{Mutex as SyncMutex, RwLock as SyncRwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use meshcore_rs::{EventPayload, EventType, MeshCore};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use tokio::time::{Instant, sleep, sleep_until};
 use tracing::{debug, info, trace, warn};
 
 use crate::config::{NetworkConfig, NetworkKind, Transport};
 use crate::mesh::{
-    IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin, PeerId, Sender,
+    Delivery, IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin, PeerId, Sender,
 };
 
 /// Conservative text budget. MeshCore does not expose a payload constant the way
@@ -131,6 +131,9 @@ pub struct MeshCoreBackend {
     next_send: Mutex<Option<Instant>>,
     /// When the contact list was last read, to keep [`NAME_REFRESH_COOLDOWN`].
     names_read_at: Mutex<Option<Instant>>,
+    /// Direct messages waiting to be acknowledged, by the tag the radio said to
+    /// expect. The acknowledgement arrives later, as an event of its own.
+    awaiting_ack: SyncMutex<HashMap<[u8; 4], oneshot::Sender<bool>>>,
 }
 
 impl MeshCoreBackend {
@@ -168,11 +171,26 @@ impl MeshCoreBackend {
             client: RwLock::new(None),
             next_send: Mutex::new(None),
             names_read_at: Mutex::new(None),
+            awaiting_ack: SyncMutex::new(HashMap::new()),
         })
+    }
+
+    /// Anything that was in flight when the link went is not going to be
+    /// acknowledged now. Dropping the waiters closes their channels, which tells
+    /// whoever is waiting straight away rather than at the timeout.
+    fn abandon_acks(&self) {
+        if let Ok(mut waiting) = self.awaiting_ack.lock() {
+            let abandoned = waiting.len();
+            if abandoned > 0 {
+                debug!(network = %self.id, abandoned, "direct messages left unacknowledged");
+            }
+            waiting.clear();
+        }
     }
 
     /// Connect, then forward messages until the link drops.
     async fn pump(&self, tx: &mpsc::Sender<IncomingMesh>) -> Result<Outcome> {
+        self.abandon_acks();
         let client = self.link.connect().await?;
 
         // Before anything is asked of the radio: a broadcast receiver only sees
@@ -287,6 +305,25 @@ impl MeshCoreBackend {
                     // what you answer says nothing the address does not.
                     reference: None,
                 })
+            }
+            // A direct message of ours reached the far node. The tag is the one
+            // the radio told us to expect when it took the message.
+            EventPayload::Ack { tag } => {
+                match self.awaiting_ack.lock() {
+                    Ok(mut waiting) => match waiting.remove(tag) {
+                        // Nobody left to tell is not a problem: the waiter timed
+                        // out and moved on.
+                        Some(waiter) => {
+                            debug!(network = %self.id, "a direct message was acknowledged");
+                            let _ = waiter.send(true);
+                        }
+                        None => {
+                            trace!(network = %self.id, "an ack we were not waiting for");
+                        }
+                    },
+                    Err(_) => warn!(network = %self.id, "the pending-ack lock is poisoned"),
+                }
+                None
             }
             _ => {
                 trace!(network = %self.id, event = ?event.event_type, "ignored");
@@ -480,13 +517,13 @@ impl MeshBackend for MeshCoreBackend {
         Ok(split_sender(text).map(|(name, _)| MessageRef::Author(name.to_owned())))
     }
 
-    async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<()> {
+    async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<Delivery> {
         let PeerId::KeyPrefix(prefix) = peer else {
             bail!("{peer} is not a MeshCore address");
         };
         let client = self.connected().await?;
         self.pace().await;
-        client
+        let sent = client
             .as_ref()
             .expect("checked just above")
             .commands()
@@ -494,8 +531,22 @@ impl MeshBackend for MeshCoreBackend {
             .await
             .send_msg(&prefix[..], text, None)
             .await
-            .map(|_| ())
-            .with_context(|| format!("sending a direct message on {}", self.id))
+            .with_context(|| format!("sending a direct message on {}", self.id))?;
+
+        // The radio says which tag to expect and how long it is worth waiting,
+        // so neither has to be guessed at. Registered after the send, because a
+        // send that failed leaves nothing to acknowledge.
+        let (tx, ack) = oneshot::channel();
+        match self.awaiting_ack.lock() {
+            Ok(mut waiting) => {
+                waiting.insert(sent.expected_ack, tx);
+            }
+            Err(_) => warn!(network = %self.id, "the pending-ack lock is poisoned"),
+        }
+        Ok(Delivery {
+            ack,
+            within: Duration::from_millis(u64::from(sent.suggested_timeout)),
+        })
     }
 
     fn resolve_name(&self, peer: &PeerId) -> Option<String> {

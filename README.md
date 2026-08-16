@@ -26,15 +26,18 @@ arriving back and being parsed, and 80 real Matrix events read.
 - A Matrix room may carry more than one route, which also bridges those meshes
   to each other.
 - Optional DM inbox: direct messages sent to the relay's node are mirrored into
-  a Matrix room, and replying to one there answers the person who wrote it.
+  a Matrix room, and replying to one there answers the person who wrote it, with
+  a reaction saying whether it arrived.
 - Duplicate and echo suppression, so bridged meshes do not loop.
 - Replies: answering a message in Matrix reaches the mesh as a reply to that
   message, in whichever way the protocol there expresses one.
 
-Deliberately out of scope: reactions, media, plugins, message history.
+Deliberately out of scope: media, plugins, message history, and relaying
+reactions in either direction — the relay posts one of its own to confirm a
+direct message, and that is the only reaction it deals in.
 
 End-to-end encrypted Matrix rooms are **not** supported yet. The Matrix side sits
-behind a four-method trait so an implementation backed by `matrix-sdk` can be
+behind a five-method trait so an implementation backed by `matrix-sdk` can be
 added behind the `e2ee` feature without touching the rest.
 
 ## Build
@@ -194,6 +197,28 @@ as a warning and nowhere else.
 Direct messages stay out of the log in both directions: the lines carry who,
 where and how many bytes, never the text. A log outlives the room a private
 message was meant for.
+
+### Whether it arrived
+
+A direct message is the one thing here that can be confirmed, because it is the
+only one addressed to a node that answers. Both protocols acknowledge one, so
+the answer is marked in Matrix with a reaction on the message you wrote:
+
+| Mark | Means |
+| ---- | ----- |
+| ✓    | The far node acknowledged it. |
+| ⚠    | Nobody acknowledged it, or the mesh said it could not be delivered. |
+
+A channel message gets no mark. A broadcast has no single recipient to answer
+it, and asking a whole channel to acknowledge would have every hearer reply at
+once — which is also why `want_ack` is set on direct messages only.
+
+How long to wait before giving up is the radio's call where the protocol makes
+one: MeshCore suggests a timeout per message and it is honoured. Meshtastic
+offers no such figure, so it waits 30 seconds, the firmware's own retransmission
+budget. A refusal from the mesh is marked as soon as it arrives rather than at
+the end of the wait, and a link that drops with an answer still in flight marks
+it at once rather than leaving it hanging.
 
 ## A hop limit of zero is not a default
 

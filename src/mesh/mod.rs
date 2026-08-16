@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 #[cfg(feature = "meshcore")]
 pub mod meshcore;
@@ -111,6 +111,29 @@ impl fmt::Display for MessageRef {
             MessageRef::Author(name) => f.write_str(name),
         }
     }
+}
+
+/// A direct message handed to a radio, and the promise of hearing whether it
+/// arrived.
+///
+/// Both protocols acknowledge a direct message, and neither does it in the
+/// answer to the send: the acknowledgement comes back over the air later and
+/// arrives through the receive loop like anything else. So a send reports what
+/// to wait for rather than what happened.
+#[derive(Debug)]
+pub struct Delivery {
+    /// `true` once the far node has acknowledged. `false` if the mesh said
+    /// outright that it could not be delivered, which is worth knowing early
+    /// rather than waiting out the timeout for.
+    ///
+    /// A dropped sender — the link went down, or the radio was replaced — closes
+    /// the channel, and an answer that never comes reads the same as one that
+    /// was never going to.
+    pub ack: oneshot::Receiver<bool>,
+    /// How long to wait before calling it lost. Asked of the radio where the
+    /// protocol says (MeshCore suggests one per message), and a fixed value
+    /// where it does not.
+    pub within: Duration,
 }
 
 /// Where a received message came from.
@@ -229,7 +252,9 @@ pub trait MeshBackend: Send + Sync {
     /// This is what an answer written in a DM inbox goes out as. No reply
     /// relation is expressed: a direct message is a conversation of two, where
     /// naming what you answer says nothing the address does not.
-    async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<()>;
+    ///
+    /// Returns what to wait on to find out whether it arrived. See [`Delivery`].
+    async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<Delivery>;
 
     /// Resolve a peer to a display name from whatever cache the backend keeps.
     fn resolve_name(&self, peer: &PeerId) -> Option<String>;

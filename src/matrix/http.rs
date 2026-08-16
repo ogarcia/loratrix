@@ -360,6 +360,38 @@ impl MatrixSink for HttpSink {
             .with_context(|| format!("reading what {room_id} called the event we sent"))?;
         Ok(sent.event_id)
     }
+
+    async fn react(&self, room_id: &str, event_id: &str, key: &str) -> Result<()> {
+        // An annotation is its own event type rather than a message, which is
+        // what keeps it out of the room's text and out of our own sync filter.
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/send/m.reaction/{}",
+            self.homeserver,
+            encode_path_segment(&self.as_server(room_id).await),
+            encode_path_segment(&self.next_txn_id()),
+        );
+        let response = self
+            .client
+            .put(&url)
+            .bearer_auth(&self.access_token)
+            .json(&json!({
+                "m.relates_to": {
+                    "rel_type": "m.annotation",
+                    "event_id": event_id,
+                    "key": key,
+                }
+            }))
+            .send()
+            .await
+            .with_context(|| format!("reacting in {room_id}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error = response.text().await.unwrap_or_default();
+            bail!("reacting in {room_id} failed with {status}: {error}");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -686,6 +718,36 @@ mod tests {
             request.contains("/rooms/%21real%3Aexample.org/send/"),
             "the alias must not travel to the send endpoint: {request}"
         );
+    }
+
+    /// A reaction is its own event type, and its shape is what decides whether a
+    /// client shows it as one rather than as a stray message.
+    #[tokio::test]
+    async fn a_reaction_annotates_the_event_it_is_about() {
+        let server = FakeHomeserver::start(vec![
+            ok(r#"{"room_id":"!real:example.org"}"#),
+            ok(r#"{"event_id":"$2"}"#),
+        ])
+        .await;
+        let sink = server.sink();
+        sink.join_rooms(&["#alias:example.org".to_owned()])
+            .await
+            .expect("joining should succeed");
+        sink.react("#alias:example.org", "$1", "✓")
+            .await
+            .expect("the reaction should succeed");
+
+        let request = &server.requests()[1];
+        assert!(
+            request.contains("/rooms/%21real%3Aexample.org/send/m.reaction/"),
+            "an annotation is not a message: {request}"
+        );
+        assert!(
+            request.contains(r#""rel_type":"m.annotation""#),
+            "{request}"
+        );
+        assert!(request.contains(r#""event_id":"$1""#), "{request}");
+        assert!(request.contains(r#""key":"✓""#), "{request}");
     }
 
     /// The whole loop: prime, then one sync carrying two events.

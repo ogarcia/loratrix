@@ -18,16 +18,24 @@ use std::time::Instant;
 
 use anyhow::{Result, bail};
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, RelayConfig, Route};
 use crate::dedupe::{Dedupe, message_key};
 use crate::matrix::{MatrixMessage, MatrixSink, RoomId};
 use crate::mesh::{
-    IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin, PeerId, Sender,
+    Delivery, IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin, PeerId, Sender,
 };
 use crate::prefix::{self, Vars};
 use crate::replies::Replies;
+
+/// Marks put on an answer written in a DM inbox, once the mesh has had its say.
+/// A tick is the far node confirming; the warning covers both a mesh that said it
+/// could not deliver and one that never answered, which to the person who wrote
+/// the message mean the same thing.
+const DELIVERED: &str = "\u{2713}";
+const UNCONFIRMED: &str = "\u{26a0}";
 
 /// The name placeholders a template can ask for, worked out once from whatever
 /// the protocol actually carried.
@@ -478,22 +486,78 @@ impl Router {
             backend.max_payload(),
         );
 
+        let who = backend
+            .resolve_name(&peer)
+            .unwrap_or_else(|| peer.to_string());
         match backend.send_direct(&peer, &payload).await {
             // As on the way in: who and where, never what.
-            Ok(()) => info!(
-                room = %message.room_id,
-                network = %network,
-                peer = %backend.resolve_name(&peer).unwrap_or_else(|| peer.to_string()),
-                sender = %names.name,
-                bytes = payload.len(),
-                "matrix -> direct message"
-            ),
+            Ok(delivery) => {
+                info!(
+                    room = %message.room_id,
+                    network = %network,
+                    peer = %who,
+                    sender = %names.name,
+                    bytes = payload.len(),
+                    "matrix -> direct message"
+                );
+                self.confirm(delivery, &message.room_id, &message.event_id, network, who);
+            }
             Err(error) => warn!(
                 network = %network,
                 %error,
                 "failed to answer a direct message"
             ),
         }
+    }
+
+    /// Wait for a direct message to be acknowledged and mark the answer in Matrix
+    /// accordingly.
+    ///
+    /// In a task of its own, because the acknowledgement takes seconds to arrive
+    /// and the relay has other messages to carry meanwhile. Nothing else depends
+    /// on the outcome, so nothing waits on the handle.
+    fn confirm(
+        &self,
+        delivery: Delivery,
+        room: &str,
+        event: &str,
+        network: NetworkId,
+        who: String,
+    ) {
+        let matrix = Arc::clone(&self.matrix);
+        let room = room.to_owned();
+        let event = event.to_owned();
+        tokio::spawn(async move {
+            // Three outcomes and two marks. Acknowledged is a tick; refused by
+            // the mesh and never answered at all are both the same warning,
+            // because to the person who wrote it they mean the same thing.
+            let delivered = match timeout(delivery.within, delivery.ack).await {
+                Ok(Ok(true)) => true,
+                Ok(Ok(false)) => {
+                    warn!(network = %network, peer = %who, "the mesh could not deliver an answer");
+                    false
+                }
+                // The link went down with the message still in flight.
+                Ok(Err(_)) => {
+                    warn!(network = %network, peer = %who, "lost track of an answer in flight");
+                    false
+                }
+                Err(_) => {
+                    warn!(
+                        network = %network,
+                        peer = %who,
+                        after = ?delivery.within,
+                        "an answer was never acknowledged"
+                    );
+                    false
+                }
+            };
+
+            let key = if delivered { DELIVERED } else { UNCONFIRMED };
+            if let Err(error) = matrix.react(&room, &event, key).await {
+                warn!(room = %room, %error, "could not mark a direct message answer");
+            }
+        });
     }
 
     /// Handle one message observed in a bridged Matrix room.
@@ -666,7 +730,7 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
 
     use super::*;
     use crate::mesh::{MeshKind, PeerId, Sender};
@@ -683,6 +747,9 @@ mod tests {
         max_payload: usize,
         sent: Mutex<Vec<(u8, String, Option<MessageRef>)>>,
         dms: Mutex<Vec<(PeerId, String)>>,
+        /// What the mesh does with the next direct message: acknowledge it,
+        /// refuse it, or never answer at all.
+        ack: Mutex<Option<bool>>,
     }
 
     impl FakeBackend {
@@ -693,6 +760,7 @@ mod tests {
                 max_payload: 200,
                 sent: Mutex::new(Vec::new()),
                 dms: Mutex::new(Vec::new()),
+                ack: Mutex::new(Some(true)),
             })
         }
 
@@ -709,6 +777,12 @@ mod tests {
 
         async fn dms(&self) -> Vec<(PeerId, String)> {
             self.dms.lock().await.clone()
+        }
+
+        /// `Some(true)` acknowledges, `Some(false)` refuses, `None` stays silent
+        /// so the wait times out.
+        async fn answers_with(&self, ack: Option<bool>) {
+            *self.ack.lock().await = ack;
         }
 
         /// What each of those was a reply to.
@@ -771,9 +845,18 @@ mod tests {
             })
         }
 
-        async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<()> {
+        async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<Delivery> {
             self.dms.lock().await.push((peer.clone(), text.to_owned()));
-            Ok(())
+            let (tx, ack) = oneshot::channel();
+            if let Some(answer) = *self.ack.lock().await {
+                let _ = tx.send(answer);
+            }
+            // Short, because a test that waits out a real mesh timeout is a test
+            // nobody runs.
+            Ok(Delivery {
+                ack,
+                within: Duration::from_millis(50),
+            })
         }
 
         fn resolve_name(&self, _peer: &PeerId) -> Option<String> {
@@ -783,17 +866,36 @@ mod tests {
 
     struct FakeSink {
         sent: Mutex<Vec<(String, String)>>,
+        reactions: Mutex<Vec<(String, String)>>,
     }
 
     impl FakeSink {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 sent: Mutex::new(Vec::new()),
+                reactions: Mutex::new(Vec::new()),
             })
         }
 
         async fn sent(&self) -> Vec<(String, String)> {
             self.sent.lock().await.clone()
+        }
+
+        /// Every annotation posted, as `(event, key)`.
+        async fn reactions(&self) -> Vec<(String, String)> {
+            self.reactions.lock().await.clone()
+        }
+
+        /// Wait for the marking task to get there, which happens off to one side.
+        async fn awaits_a_reaction(&self) -> Vec<(String, String)> {
+            for _ in 0..100 {
+                let seen = self.reactions().await;
+                if !seen.is_empty() {
+                    return seen;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Vec::new()
         }
 
         /// The id this fake would have given the nth message it posted, counting
@@ -821,6 +923,14 @@ mod tests {
             let mut sent = self.sent.lock().await;
             sent.push((room_id.to_owned(), body.to_owned()));
             Ok(Self::event_id(sent.len()))
+        }
+
+        async fn react(&self, _room_id: &str, event_id: &str, key: &str) -> Result<()> {
+            self.reactions
+                .lock()
+                .await
+                .push((event_id.to_owned(), key.to_owned()));
+            Ok(())
         }
     }
 
@@ -1530,6 +1640,110 @@ mod tests {
             h.mc.sent().await.is_empty(),
             "an inbox never reaches a channel"
         );
+    }
+
+    /// A direct message is the one thing here that can be confirmed to have
+    /// arrived, and the tick is where that is said.
+    #[tokio::test]
+    async fn an_acknowledged_answer_is_ticked() {
+        let h = harness(DM_ROOMS);
+        let now = Instant::now();
+        h.router
+            .handle_mesh(direct("mc", Some("Alice"), "estas ahi?"), now)
+            .await;
+        h.router
+            .handle_matrix(
+                replying_to(
+                    &FakeSink::event_id(1),
+                    "!dm:example.org",
+                    "@bob:example.org",
+                    "aqui estoy",
+                ),
+                now,
+            )
+            .await;
+
+        assert_eq!(
+            h.sink.awaits_a_reaction().await,
+            [("$typed:example.org".to_owned(), DELIVERED.to_owned())],
+            "the mark goes on the answer, which is the message the writer is looking at"
+        );
+    }
+
+    /// A node that is off, or out of range, simply never answers. Saying nothing
+    /// would leave that looking the same as a message still on its way.
+    #[tokio::test]
+    async fn an_answer_nobody_acknowledges_is_marked_unconfirmed() {
+        let h = harness(DM_ROOMS);
+        let now = Instant::now();
+        h.mc.answers_with(None).await;
+        h.router
+            .handle_mesh(direct("mc", Some("Alice"), "estas ahi?"), now)
+            .await;
+        h.router
+            .handle_matrix(
+                replying_to(
+                    &FakeSink::event_id(1),
+                    "!dm:example.org",
+                    "@bob:example.org",
+                    "aqui estoy",
+                ),
+                now,
+            )
+            .await;
+
+        assert_eq!(
+            h.sink.awaits_a_reaction().await,
+            [("$typed:example.org".to_owned(), UNCONFIRMED.to_owned())]
+        );
+    }
+
+    /// A mesh that says outright it could not deliver gets the same mark, but
+    /// without waiting out the timeout for it.
+    #[tokio::test]
+    async fn a_refused_answer_is_marked_without_waiting() {
+        let h = harness(DM_ROOMS);
+        let now = Instant::now();
+        h.mc.answers_with(Some(false)).await;
+        h.router
+            .handle_mesh(direct("mc", Some("Alice"), "estas ahi?"), now)
+            .await;
+        h.router
+            .handle_matrix(
+                replying_to(
+                    &FakeSink::event_id(1),
+                    "!dm:example.org",
+                    "@bob:example.org",
+                    "aqui estoy",
+                ),
+                now,
+            )
+            .await;
+
+        assert_eq!(
+            h.sink.awaits_a_reaction().await,
+            [("$typed:example.org".to_owned(), UNCONFIRMED.to_owned())]
+        );
+    }
+
+    /// Nothing was sent, so there is nothing to confirm and nothing to mark.
+    #[tokio::test]
+    async fn an_undeliverable_answer_is_not_marked_either_way() {
+        let h = harness(DM_ROOMS);
+        h.router
+            .handle_matrix(
+                replying_to(
+                    "$long-gone:example.org",
+                    "!dm:example.org",
+                    "@bob:example.org",
+                    "aqui estoy",
+                ),
+                Instant::now(),
+            )
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(h.sink.reactions().await.is_empty());
     }
 
     /// Every room mirroring the message can be replied to, not just the first.

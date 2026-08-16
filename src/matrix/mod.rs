@@ -1,6 +1,6 @@
 //! The Matrix-side abstraction.
 //!
-//! Deliberately narrow — four methods — because a second implementation is
+//! Deliberately narrow — five methods — because a second implementation is
 //! planned: the `e2ee` feature will swap the lean HTTP client for a matrix-sdk
 //! one that can talk to encrypted rooms. Every method added here has to be
 //! written twice, so the trait stays at the smallest surface a relay needs.
@@ -44,6 +44,14 @@ pub trait MatrixSink: Send + Sync {
     /// Post a message and report the id the server gave it, which is what ties
     /// it to whatever came back over the mesh.
     async fn send_text(&self, room_id: &str, body: &str) -> Result<EventId>;
+
+    /// Annotate an event with a short key, which clients show as a reaction.
+    ///
+    /// The fifth method on a trait that was meant to hold four, and worth it for
+    /// one reason: a direct message is the only thing here that can be confirmed
+    /// to have arrived, and saying so without adding a line to the room needs a
+    /// reaction. It is also what relaying the mesh's own reactions will want.
+    async fn react(&self, room_id: &str, event_id: &str, key: &str) -> Result<()>;
 }
 
 /// Drop the quoted original from the body of a reply.
