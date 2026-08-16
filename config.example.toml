@@ -56,6 +56,13 @@ access_token_file = "~/.config/loratrix/token"
 #meshtastic_dm_prefix = "[DM]{network_tag} {short}: "
 #meshcore_dm_prefix = "[DM]{network_tag} {name}: "
 
+# And on the way back: reply to a direct message in its inbox room and the answer
+# is sent to whoever wrote it. The prefix says which person in the room answered,
+# which the node at the other end has no other way of knowing.
+#matrix_to_dm_prefix = "{name5}[M]: "
+#matrix_to_meshtastic_dm_prefix = "{short}[M]: "
+#matrix_to_meshcore_dm_prefix = "{name}: "
+
 # Shown instead of a name when the protocol does not carry one and none could be
 # read out of the text. See the note on MeshCore channels in the README.
 #unknown_sender_name = "unknown"

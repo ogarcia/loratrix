@@ -111,13 +111,24 @@ pub struct RelayConfig {
     #[serde(default)]
     pub meshcore_to_meshtastic_prefix: Option<String>,
 
-    /// Prefix used for direct messages landing in a read-only DM inbox room.
+    /// Prefix used for direct messages landing in a DM inbox room.
     #[serde(default = "default_dm_prefix")]
     pub dm_prefix: String,
     #[serde(default)]
     pub meshtastic_dm_prefix: Option<String>,
     #[serde(default)]
     pub meshcore_dm_prefix: Option<String>,
+
+    /// Prefix on an answer going the other way: written in an inbox room and
+    /// sent back to whoever wrote the direct message it replies to. Worth
+    /// having because the room may hold more than one person, and the node at
+    /// the other end has no other way of knowing which of them answered.
+    #[serde(default = "default_matrix_to_dm_prefix")]
+    pub matrix_to_dm_prefix: String,
+    #[serde(default)]
+    pub matrix_to_meshtastic_dm_prefix: Option<String>,
+    #[serde(default)]
+    pub matrix_to_meshcore_dm_prefix: Option<String>,
     /// Stand-in for `{name}` when the protocol did not tell us who sent the
     /// message, which is every MeshCore channel message. The real name is
     /// usually inside the text itself.
@@ -142,6 +153,9 @@ impl Default for RelayConfig {
             dm_prefix: default_dm_prefix(),
             meshtastic_dm_prefix: None,
             meshcore_dm_prefix: None,
+            matrix_to_dm_prefix: default_matrix_to_dm_prefix(),
+            matrix_to_meshtastic_dm_prefix: None,
+            matrix_to_meshcore_dm_prefix: None,
             unknown_sender_name: default_unknown_sender_name(),
         }
     }
@@ -191,6 +205,17 @@ impl RelayConfig {
         )
     }
 
+    /// Template for an answer written in an inbox room, going back out as a
+    /// direct message.
+    pub fn matrix_to_dm(&self, to: Option<MeshKind>) -> &str {
+        self.per_kind(
+            to,
+            &self.matrix_to_meshtastic_dm_prefix,
+            &self.matrix_to_meshcore_dm_prefix,
+            &self.matrix_to_dm_prefix,
+        )
+    }
+
     /// Template for a mesh message fanned out to the other mesh in its room.
     /// Named for where it is going, since that is whose payload it spends.
     pub fn mesh_to_mesh(&self, to: Option<MeshKind>) -> &str {
@@ -236,6 +261,12 @@ fn default_mesh_to_matrix_prefix() -> String {
 }
 
 fn default_matrix_to_mesh_prefix() -> String {
+    "{name5}[M]: ".to_owned()
+}
+
+/// The same as a channel message. A direct message spends the same payload and
+/// the reader has the same question about who is talking.
+fn default_matrix_to_dm_prefix() -> String {
     "{name5}[M]: ".to_owned()
 }
 
@@ -323,8 +354,9 @@ pub struct RoomConfig {
     /// other routes as well as to Matrix.
     #[serde(default)]
     pub routes: Vec<Route>,
-    /// Networks whose direct messages are mirrored into this room. A DM inbox
-    /// is read-only: nothing written in the room is sent back to the mesh.
+    /// Networks whose direct messages are mirrored into this room. Nothing
+    /// written in an inbox reaches a mesh channel; a reply written in one is
+    /// sent back to whoever wrote the message it answers.
     #[serde(default)]
     pub dm_inbox: Option<NetworkList>,
 }
@@ -417,8 +449,9 @@ impl Config {
             }
             if !room.routes.is_empty() && room.is_dm_inbox() {
                 bail!(
-                    "room {:?} mixes routes with dm_inbox; a DM inbox is read-only, \
-                     so give it its own room",
+                    "room {:?} mixes routes with dm_inbox; a reply written in an \
+                     inbox answers a person rather than a channel, so give it its \
+                     own room",
                     room.id
                 );
             }
@@ -604,7 +637,7 @@ mod tests {
     fn rejects_mixing_routes_and_dm_inbox() {
         let raw = format!("{MINIMAL}\ndm_inbox = \"lora\"\n");
         let error = parse(&raw).expect_err("a room cannot be both");
-        assert!(error.to_string().contains("read-only"), "{error}");
+        assert!(error.to_string().contains("own room"), "{error}");
     }
 
     #[test]

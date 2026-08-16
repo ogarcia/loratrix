@@ -25,8 +25,8 @@ arriving back and being parsed, and 80 real Matrix events read.
 - Several mesh networks in one process, Meshtastic and MeshCore mixed freely.
 - A Matrix room may carry more than one route, which also bridges those meshes
   to each other.
-- Optional read-only DM inbox: direct messages sent to the relay's node are
-  mirrored into a Matrix room where you can read them but not answer.
+- Optional DM inbox: direct messages sent to the relay's node are mirrored into
+  a Matrix room, and replying to one there answers the person who wrote it.
 - Duplicate and echo suppression, so bridged meshes do not loop.
 - Replies: answering a message in Matrix reaches the mesh as a reply to that
   message, in whichever way the protocol there expresses one.
@@ -103,8 +103,8 @@ room !bridge:example.org  (bridged: messages are also forwarded between these me
   <-> mc channel 1 [meshcore, 160 B payload, 2s min gap]
 room !general:example.org
   <-> lora channel 0 [meshtastic, 233 B payload, 2s min gap]
-room !dm:example.org <-- lora direct messages (read-only)
-room !dm:example.org <-- mc direct messages (read-only)
+room !dm:example.org <-- lora direct messages (reply to one to answer it)
+room !dm:example.org <-- mc direct messages (reply to one to answer it)
 ```
 
 Logging follows `RUST_LOG`, for example `RUST_LOG=loratrix=debug`.
@@ -173,6 +173,27 @@ of a couple of hundred bytes the quote is charged against the answer.
 
 The other direction — a reply written on the mesh arriving in Matrix as a rich
 reply — is not implemented.
+
+### Answering a direct message
+
+The same mechanism is what makes a DM inbox answerable. Reply to a mirrored
+direct message and the answer goes back to the person who wrote it, over the
+network they wrote from, prefixed with `matrix_to_dm_prefix` so the node at the
+other end knows which member of the room answered.
+
+**Only a reply can be delivered.** An inbox holds everybody's direct messages
+mixed together, so a line written on its own has no recipient that could be
+worked out, and it is dropped. Guessing at the last person to speak would send
+somebody's private answer to the wrong person, which is a worse failure than not
+sending it.
+
+Nothing is posted in the room when an answer cannot be delivered — because the
+event is older than the window, or from before a restart. That goes to the log
+as a warning and nowhere else.
+
+Direct messages stay out of the log in both directions: the lines carry who,
+where and how many bytes, never the text. A log outlives the room a private
+message was meant for.
 
 ## A hop limit of zero is not a default
 

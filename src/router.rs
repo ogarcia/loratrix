@@ -23,7 +23,9 @@ use tracing::{debug, info, warn};
 use crate::config::{Config, RelayConfig, Route};
 use crate::dedupe::{Dedupe, message_key};
 use crate::matrix::{MatrixMessage, MatrixSink, RoomId};
-use crate::mesh::{IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin, Sender};
+use crate::mesh::{
+    IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin, PeerId, Sender,
+};
 use crate::prefix::{self, Vars};
 use crate::replies::Replies;
 
@@ -84,8 +86,9 @@ pub struct Router {
     outbound: HashMap<RoomId, Vec<Route>>,
     /// network -> DM inbox rooms mirroring its direct messages.
     dm_inboxes: HashMap<NetworkId, Vec<DmTarget>>,
-    /// Rooms that only mirror DMs and therefore never send to a mesh.
-    read_only: HashSet<RoomId>,
+    /// DM inbox rooms. Nothing written in one reaches a mesh channel; a reply
+    /// written in one goes back to whoever it answers.
+    inboxes: HashSet<RoomId>,
     dedupe: Mutex<Dedupe>,
     /// Which mesh message each relayed Matrix event is, so that a reply can be
     /// relayed as one.
@@ -106,7 +109,7 @@ impl Router {
         let mut inbound: HashMap<NetworkId, HashMap<u8, RoomId>> = HashMap::new();
         let mut outbound: HashMap<RoomId, Vec<Route>> = HashMap::new();
         let mut dm_inboxes: HashMap<NetworkId, Vec<DmTarget>> = HashMap::new();
-        let mut read_only = HashSet::new();
+        let mut inboxes = HashSet::new();
 
         for room in &config.rooms {
             for route in &room.routes {
@@ -133,7 +136,7 @@ impl Router {
                     });
             }
             if room.is_dm_inbox() {
-                read_only.insert(room.id.clone());
+                inboxes.insert(room.id.clone());
             }
         }
 
@@ -144,7 +147,7 @@ impl Router {
             inbound,
             outbound,
             dm_inboxes,
-            read_only,
+            inboxes,
             dedupe: Mutex::new(Dedupe::new(config.relay.dedupe_window())),
             replies: Mutex::new(Replies::new(config.relay.reply_window())),
         };
@@ -171,6 +174,7 @@ impl Router {
                 from_matrix = ?self.relay.matrix_to_mesh(Some(kind)),
                 from_other_mesh = ?self.relay.mesh_to_mesh(Some(kind)),
                 direct_to_matrix = ?self.relay.dm(Some(kind)),
+                answering_a_direct = ?self.relay.matrix_to_dm(Some(kind)),
                 "prefixes"
             );
         }
@@ -181,7 +185,7 @@ impl Router {
         let mut rooms: Vec<RoomId> = self
             .outbound
             .keys()
-            .chain(self.read_only.iter())
+            .chain(self.inboxes.iter())
             .cloned()
             .collect();
         rooms.sort_unstable();
@@ -227,7 +231,7 @@ impl Router {
         for network in dm_networks {
             for target in &self.dm_inboxes[network] {
                 lines.push(format!(
-                    "room {} <-- {} direct messages (read-only)",
+                    "room {} <-- {} direct messages (reply to one to answer it)",
                     target.room, network
                 ));
             }
@@ -249,7 +253,7 @@ impl Router {
 
         match &message.origin {
             Origin::Channel(channel) => self.relay_channel(&message, *channel, now).await,
-            Origin::Direct(peer) => self.relay_direct(&message, peer).await,
+            Origin::Direct(peer) => self.relay_direct(&message, peer, now).await,
         }
     }
 
@@ -374,7 +378,7 @@ impl Router {
         }
     }
 
-    async fn relay_direct(&self, message: &IncomingMesh, peer: &crate::mesh::PeerId) {
+    async fn relay_direct(&self, message: &IncomingMesh, peer: &PeerId, now: Instant) {
         let Some(targets) = self.dm_inboxes.get(&message.network) else {
             debug!(
                 network = %message.network,
@@ -411,17 +415,84 @@ impl Router {
                 // Who and where, but not what. A direct message was addressed
                 // to this node and to nobody else, and a log is a place text
                 // outlives the room it was meant for.
-                Ok(_) => info!(
-                    network = %message.network,
-                    room = %target.room,
-                    sender = %names.name,
-                    bytes = message.text.len(),
-                    "direct message -> matrix"
-                ),
+                Ok(event) => {
+                    info!(
+                        network = %message.network,
+                        room = %target.room,
+                        sender = %names.name,
+                        bytes = message.text.len(),
+                        "direct message -> matrix"
+                    );
+                    // Which is what makes answering it possible: a reply to this
+                    // event is a reply to this person, on this network.
+                    self.replies.lock().await.remember_correspondent(
+                        &event,
+                        &message.network,
+                        peer,
+                        now,
+                    );
+                }
                 Err(error) => {
                     warn!(room = %target.room, %error, "failed to mirror a direct message")
                 }
             }
+        }
+    }
+
+    /// Send an answer written in a DM inbox back to the person it answers.
+    ///
+    /// An inbox holds the direct messages of everyone who writes to the node, all
+    /// mixed together, so **only a reply can be delivered**: it is the reply that
+    /// says which of them is being answered. A line written on its own has no
+    /// recipient that could be worked out, and guessing at the last one to speak
+    /// would send somebody's private answer to the wrong person.
+    async fn answer_direct(&self, message: &MatrixMessage, now: Instant) {
+        let Some(event) = &message.reply_to else {
+            debug!(
+                room = %message.room_id,
+                "a message written in a DM inbox that replies to nothing, dropping"
+            );
+            return;
+        };
+        let Some((network, peer)) = self.replies.lock().await.correspondent(event, now) else {
+            // Older than the window, or from before a restart. Nothing is said in
+            // the room about it; the log is where this lives.
+            warn!(
+                room = %message.room_id,
+                "cannot answer a direct message this relay no longer remembers"
+            );
+            return;
+        };
+        let Some(backend) = self.backends.get(&network) else {
+            warn!(network = %network, "no backend to answer a direct message on");
+            return;
+        };
+
+        let names = Names::of_matrix_user(matrix_localpart(&message.sender));
+        let payload = prefix::fit(
+            &prefix::render(
+                self.relay.matrix_to_dm(Some(backend.kind())),
+                &names.vars(&network, "", None),
+            ),
+            &message.body,
+            backend.max_payload(),
+        );
+
+        match backend.send_direct(&peer, &payload).await {
+            // As on the way in: who and where, never what.
+            Ok(()) => info!(
+                room = %message.room_id,
+                network = %network,
+                peer = %backend.resolve_name(&peer).unwrap_or_else(|| peer.to_string()),
+                sender = %names.name,
+                bytes = payload.len(),
+                "matrix -> direct message"
+            ),
+            Err(error) => warn!(
+                network = %network,
+                %error,
+                "failed to answer a direct message"
+            ),
         }
     }
 
@@ -430,11 +501,8 @@ impl Router {
         if message.sender == self.matrix.user_id() {
             return;
         }
-        if self.read_only.contains(&message.room_id) {
-            debug!(
-                room = %message.room_id,
-                "ignoring a message written in a read-only DM inbox"
-            );
+        if self.inboxes.contains(&message.room_id) {
+            self.answer_direct(&message, now).await;
             return;
         }
         let Some(routes) = self.outbound.get(&message.room_id) else {
@@ -614,6 +682,7 @@ mod tests {
         kind: MeshKind,
         max_payload: usize,
         sent: Mutex<Vec<(u8, String, Option<MessageRef>)>>,
+        dms: Mutex<Vec<(PeerId, String)>>,
     }
 
     impl FakeBackend {
@@ -623,6 +692,7 @@ mod tests {
                 kind,
                 max_payload: 200,
                 sent: Mutex::new(Vec::new()),
+                dms: Mutex::new(Vec::new()),
             })
         }
 
@@ -635,6 +705,10 @@ mod tests {
                 .iter()
                 .map(|(channel, text, _)| (*channel, text.clone()))
                 .collect()
+        }
+
+        async fn dms(&self) -> Vec<(PeerId, String)> {
+            self.dms.lock().await.clone()
         }
 
         /// What each of those was a reply to.
@@ -697,7 +771,8 @@ mod tests {
             })
         }
 
-        async fn send_direct(&self, _peer: &PeerId, _text: &str) -> Result<()> {
+        async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<()> {
+            self.dms.lock().await.push((peer.clone(), text.to_owned()));
             Ok(())
         }
 
@@ -1416,6 +1491,173 @@ mod tests {
                 .all(|(_, body)| body.contains("!1a2b3c4d")),
             "an unresolvable sender must still be identified by address"
         );
+    }
+
+    /// The point of the whole exercise: answer a direct message in the inbox and
+    /// it goes back to the person who wrote it, on the network they wrote from.
+    #[tokio::test]
+    async fn a_reply_in_the_inbox_answers_whoever_wrote_the_message() {
+        let h = harness(DM_ROOMS);
+        let now = Instant::now();
+        h.router
+            .handle_mesh(direct("mc", Some("Alice"), "estas ahi?"), now)
+            .await;
+
+        // The inbox that only listens to mc got it second, sorted; take the id
+        // the fake gave whichever room came first, both mirror the same message.
+        h.router
+            .handle_matrix(
+                replying_to(
+                    &FakeSink::event_id(1),
+                    "!dm:example.org",
+                    "@bob:example.org",
+                    "aqui estoy",
+                ),
+                now,
+            )
+            .await;
+
+        assert_eq!(
+            h.mc.dms().await,
+            [(PeerId::Node(0x1a2b_3c4d), "bob[M]: aqui estoy".to_owned())],
+            "the answer goes to the peer who wrote, with a prefix naming who answered"
+        );
+        assert!(
+            h.lora.dms().await.is_empty(),
+            "and not to the other network in the same inbox"
+        );
+        assert!(
+            h.mc.sent().await.is_empty(),
+            "an inbox never reaches a channel"
+        );
+    }
+
+    /// Every room mirroring the message can be replied to, not just the first.
+    #[tokio::test]
+    async fn either_inbox_mirroring_a_message_can_answer_it() {
+        let h = harness(DM_ROOMS);
+        let now = Instant::now();
+        h.router
+            .handle_mesh(direct("mc", Some("Alice"), "estas ahi?"), now)
+            .await;
+
+        for nth in 1..=2 {
+            h.router
+                .handle_matrix(
+                    replying_to(
+                        &FakeSink::event_id(nth),
+                        "!dm:example.org",
+                        "@bob:example.org",
+                        "aqui estoy",
+                    ),
+                    now,
+                )
+                .await;
+        }
+
+        assert_eq!(
+            h.mc.dms().await.len(),
+            2,
+            "both mirrors of one message point at the same person"
+        );
+    }
+
+    /// Answering the same message twice must work, the same as on a channel.
+    #[tokio::test]
+    async fn a_direct_message_can_be_answered_more_than_once() {
+        let h = harness(DM_ROOMS);
+        let now = Instant::now();
+        h.router
+            .handle_mesh(direct("mc", Some("Alice"), "estas ahi?"), now)
+            .await;
+
+        for text in ["si", "dime"] {
+            h.router
+                .handle_matrix(
+                    replying_to(
+                        &FakeSink::event_id(1),
+                        "!dm:example.org",
+                        "@bob:example.org",
+                        text,
+                    ),
+                    now,
+                )
+                .await;
+        }
+
+        let dms = h.mc.dms().await;
+        assert_eq!(dms.len(), 2, "reading the table must not consume it");
+        assert_eq!(dms[1].1, "bob[M]: dime");
+    }
+
+    /// Older than the window, or from before a restart. Nothing is sent, and
+    /// nothing is said in the room about it either.
+    #[tokio::test]
+    async fn a_reply_to_a_direct_message_we_forgot_sends_nothing() {
+        let h = harness(DM_ROOMS);
+        h.router
+            .handle_matrix(
+                replying_to(
+                    "$long-gone:example.org",
+                    "!dm:example.org",
+                    "@bob:example.org",
+                    "aqui estoy",
+                ),
+                Instant::now(),
+            )
+            .await;
+
+        assert!(h.mc.dms().await.is_empty());
+        assert!(h.lora.dms().await.is_empty());
+        assert!(
+            h.sink.sent().await.is_empty(),
+            "the log is where this lives, not the room"
+        );
+    }
+
+    /// An inbox holds everybody's direct messages at once, so a line written on
+    /// its own has no recipient that could be worked out.
+    #[tokio::test]
+    async fn a_message_written_in_an_inbox_that_answers_nothing_goes_nowhere() {
+        let h = harness(DM_ROOMS);
+        let now = Instant::now();
+        h.router
+            .handle_mesh(direct("mc", Some("Alice"), "estas ahi?"), now)
+            .await;
+
+        h.router
+            .handle_matrix(
+                from_matrix("!dm:example.org", "@bob:example.org", "aqui estoy"),
+                now,
+            )
+            .await;
+
+        assert!(
+            h.mc.dms().await.is_empty(),
+            "guessing at the last one to speak would answer the wrong person"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_cut_to_the_payload_budget() {
+        let h = harness(DM_ROOMS);
+        let now = Instant::now();
+        h.router
+            .handle_mesh(direct("mc", Some("Alice"), "estas ahi?"), now)
+            .await;
+        h.router
+            .handle_matrix(
+                replying_to(
+                    &FakeSink::event_id(1),
+                    "!dm:example.org",
+                    "@bob:example.org",
+                    &"x".repeat(500),
+                ),
+                now,
+            )
+            .await;
+
+        assert_eq!(h.mc.dms().await[0].1.len(), 200);
     }
 
     #[tokio::test]

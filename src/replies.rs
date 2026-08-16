@@ -19,6 +19,12 @@
 //! Which is also what keeps this bounded, along with a hard ceiling for the case
 //! where the window is set generously and the mesh turns out to be busy.
 //!
+//! Direct messages are remembered here too, but by *correspondent* rather than
+//! by message: an inbox room mixes everybody's direct messages together, so what
+//! a reply there needs to resolve is which person is being answered and on which
+//! network. Naming a message would add nothing — a direct message is a
+//! conversation of two, and the address already says which.
+//!
 //! Keyed by hash rather than by the ids themselves, the same bargain
 //! [`crate::dedupe`] makes and for the same reason: it is eight bytes instead of
 //! sixty, and it needs no allocation to look one up. A collision would answer the
@@ -28,7 +34,7 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, Instant};
 
-use crate::mesh::MessageRef;
+use crate::mesh::{MessageRef, NetworkId, PeerId};
 
 /// Most entries to hold regardless of the window, so that a long window cannot
 /// become unbounded memory. At two dozen bytes an entry this is well under a
@@ -44,9 +50,18 @@ fn key(event: &str, network: &str) -> u64 {
     hasher.finish()
 }
 
+/// Who wrote the direct message a Matrix event is mirroring.
+pub type Correspondent = (NetworkId, PeerId);
+
 pub struct Replies {
     window: Duration,
     known: HashMap<u64, (MessageRef, Instant)>,
+    /// Mirrored direct messages, so an answer written in an inbox room can be
+    /// sent back to the person who wrote the message it answers.
+    ///
+    /// Keyed by event alone, unlike `known`: a direct message arrives on one
+    /// network, and which one is part of the answer rather than of the question.
+    correspondents: HashMap<u64, (Correspondent, Instant)>,
 }
 
 impl Replies {
@@ -54,7 +69,30 @@ impl Replies {
         Self {
             window,
             known: HashMap::new(),
+            correspondents: HashMap::new(),
         }
+    }
+
+    /// Record that a Matrix event is the mirror of a direct message from `peer`.
+    pub fn remember_correspondent(
+        &mut self,
+        event: &str,
+        network: &str,
+        peer: &PeerId,
+        now: Instant,
+    ) {
+        self.prune(now);
+        self.correspondents
+            .insert(key(event, ""), ((network.to_owned(), peer.clone()), now));
+    }
+
+    /// Who to answer, for a reply to `event`. As above, reading does not forget:
+    /// one direct message may be answered more than once.
+    pub fn correspondent(&self, event: &str, now: Instant) -> Option<Correspondent> {
+        self.correspondents
+            .get(&key(event, ""))
+            .filter(|(_, at)| now.duration_since(*at) < self.window)
+            .map(|(who, _)| who.clone())
     }
 
     /// Record that a Matrix event and a mesh message are the same message.
@@ -83,31 +121,40 @@ impl Replies {
         let window = self.window;
         self.known
             .retain(|_, (_, at)| now.duration_since(*at) < window);
-
-        if self.known.len() < MAX_ENTRIES {
-            return;
-        }
-        // Keep the newest half. Trimming to exactly the ceiling would make the
-        // next insertion sort all over again, and the one after that.
-        //
-        // By key rather than by a cutoff instant, because a burst arriving inside
-        // one tick of the clock gives every entry the same age, and a cutoff would
-        // then keep all of them or none.
-        let mut by_age: Vec<(u64, Instant)> = self
-            .known
-            .iter()
-            .map(|(key, (_, at))| (*key, *at))
-            .collect();
-        by_age.sort_unstable_by_key(|(_, at)| *at);
-        let excess = self.known.len() - MAX_ENTRIES / 2;
-        for (key, _) in by_age.into_iter().take(excess) {
-            self.known.remove(&key);
-        }
+        self.correspondents
+            .retain(|_, (_, at)| now.duration_since(*at) < window);
+        trim(&mut self.known);
+        trim(&mut self.correspondents);
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
         self.known.len()
+    }
+
+    #[cfg(test)]
+    fn correspondents(&self) -> usize {
+        self.correspondents.len()
+    }
+}
+
+/// Bring a map back under [`MAX_ENTRIES`] by dropping its oldest entries.
+///
+/// Down to half the ceiling rather than to the ceiling itself, or the insertion
+/// after this one would sort all over again, and the one after that.
+///
+/// By key rather than by a cutoff instant, because a burst arriving inside one
+/// tick of the clock gives every entry the same age, and a cutoff would then
+/// keep all of them or none.
+fn trim<T>(map: &mut HashMap<u64, (T, Instant)>) {
+    if map.len() < MAX_ENTRIES {
+        return;
+    }
+    let mut by_age: Vec<(u64, Instant)> = map.iter().map(|(key, (_, at))| (*key, *at)).collect();
+    by_age.sort_unstable_by_key(|(_, at)| *at);
+    let excess = map.len() - MAX_ENTRIES / 2;
+    for (key, _) in by_age.into_iter().take(excess) {
+        map.remove(&key);
     }
 }
 
@@ -211,6 +258,55 @@ mod tests {
             "the ceiling must hold: {} entries",
             replies.len()
         );
+    }
+
+    #[test]
+    fn remembers_who_wrote_a_direct_message() {
+        let mut replies = Replies::new(WINDOW);
+        let now = Instant::now();
+        let alice = PeerId::Node(0x1a2b_3c4d);
+        replies.remember_correspondent("$abc", "lora", &alice, now);
+
+        assert_eq!(
+            replies.correspondent("$abc", now),
+            Some(("lora".to_owned(), alice)),
+            "the network is part of the answer: it says where to send it"
+        );
+        assert_eq!(replies.correspondent("$other", now), None);
+    }
+
+    /// One direct message may be answered many times, and it is mirrored into
+    /// every listening inbox, so each of those events must resolve too.
+    #[test]
+    fn a_correspondent_survives_being_read() {
+        let mut replies = Replies::new(WINDOW);
+        let now = Instant::now();
+        let alice = PeerId::KeyPrefix([1, 2, 3, 4, 5, 6]);
+        replies.remember_correspondent("$abc", "mc", &alice, now);
+
+        for _ in 0..3 {
+            assert!(replies.correspondent("$abc", now).is_some());
+        }
+    }
+
+    #[test]
+    fn a_correspondent_is_forgotten_with_everything_else() {
+        let mut replies = Replies::new(WINDOW);
+        let now = Instant::now();
+        replies.remember_correspondent("$abc", "lora", &PeerId::Node(7), now);
+
+        assert_eq!(
+            replies.correspondent("$abc", now + Duration::from_secs(3601)),
+            None
+        );
+        // And the sweep reclaims it rather than leaving it to be refused.
+        replies.remember(
+            "$fresh",
+            "lora",
+            MessageRef::Packet(1),
+            now + Duration::from_secs(3601),
+        );
+        assert_eq!(replies.correspondents(), 0);
     }
 
     /// Trimming keeps the newest, because those are the ones still worth a reply.

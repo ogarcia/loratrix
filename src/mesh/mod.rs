@@ -226,9 +226,9 @@ pub trait MeshBackend: Send + Sync {
 
     /// Send a direct message to a peer.
     ///
-    /// Unused while DM inboxes are read-only, but both protocols support it, so
-    /// the trait keeps the door open for an explicit reply syntax later.
-    #[allow(dead_code, reason = "reserved for replying to direct messages")]
+    /// This is what an answer written in a DM inbox goes out as. No reply
+    /// relation is expressed: a direct message is a conversation of two, where
+    /// naming what you answer says nothing the address does not.
     async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<()>;
 
     /// Resolve a peer to a display name from whatever cache the backend keeps.
