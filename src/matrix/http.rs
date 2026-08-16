@@ -31,7 +31,7 @@ use tokio::time::sleep;
 use tracing::{debug, info, trace, warn};
 
 use crate::config::MatrixConfig;
-use crate::matrix::{EventId, MatrixMessage, MatrixSink, RoomId};
+use crate::matrix::{EventId, MatrixMessage, MatrixSink, MsgKind, RoomId};
 
 /// How long the server may hold a `/sync` open waiting for something to happen.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -333,7 +333,7 @@ impl MatrixSink for HttpSink {
         }
     }
 
-    async fn send_text(&self, room_id: &str, body: &str) -> Result<EventId> {
+    async fn send(&self, room_id: &str, body: &str, kind: MsgKind) -> Result<EventId> {
         let url = format!(
             "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
             self.homeserver,
@@ -344,7 +344,7 @@ impl MatrixSink for HttpSink {
             .client
             .put(&url)
             .bearer_auth(&self.access_token)
-            .json(&json!({ "msgtype": "m.text", "body": body }))
+            .json(&json!({ "msgtype": kind.msgtype(), "body": body }))
             .send()
             .await
             .with_context(|| format!("sending to {room_id}"))?;
@@ -640,7 +640,7 @@ mod tests {
         let server = FakeHomeserver::start(vec![ok(r#"{"event_id":"$1"}"#)]).await;
         server
             .sink()
-            .send_text("!room:example.org", "hola")
+            .send("!room:example.org", "hola", MsgKind::Text)
             .await
             .expect("the send should succeed");
 
@@ -665,7 +665,7 @@ mod tests {
             FakeHomeserver::start(vec![(403, r#"{"errcode":"M_FORBIDDEN"}"#.to_owned())]).await;
         let error = server
             .sink()
-            .send_text("!room:example.org", "hola")
+            .send("!room:example.org", "hola", MsgKind::Text)
             .await
             .expect_err("a rejected send must fail");
 
@@ -709,7 +709,7 @@ mod tests {
         sink.join_rooms(&["#alias:example.org".to_owned()])
             .await
             .expect("joining should succeed");
-        sink.send_text("#alias:example.org", "hola")
+        sink.send("#alias:example.org", "hola", MsgKind::Text)
             .await
             .expect("the send should succeed");
 

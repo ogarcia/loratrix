@@ -50,8 +50,30 @@ fn key(event: &str, network: &str) -> u64 {
     hasher.finish()
 }
 
+/// And the other way round: "this mesh message, as it was posted in this room".
+/// The room is part of it because a direct message is mirrored into every inbox
+/// listening, and each of those is a different event.
+fn posted_key(network: &str, message: &MessageRef, room: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    network.hash(&mut hasher);
+    message.hash(&mut hasher);
+    room.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Who wrote the direct message a Matrix event is mirroring.
 pub type Correspondent = (NetworkId, PeerId);
+
+/// Where a mesh message ended up in Matrix, which is what a reaction arriving
+/// later has to be attached to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Posted {
+    pub room: String,
+    pub event: String,
+    /// Enough of the text to quote it back, or `None` where quoting it would
+    /// repeat something private. See [`Replies::remember_posted`].
+    pub excerpt: Option<String>,
+}
 
 pub struct Replies {
     window: Duration,
@@ -62,6 +84,9 @@ pub struct Replies {
     /// Keyed by event alone, unlike `known`: a direct message arrives on one
     /// network, and which one is part of the answer rather than of the question.
     correspondents: HashMap<u64, (Correspondent, Instant)>,
+    /// Where each mesh message ended up in Matrix, for attaching a reaction that
+    /// arrives afterwards.
+    posted: HashMap<u64, (Posted, Instant)>,
 }
 
 impl Replies {
@@ -70,6 +95,7 @@ impl Replies {
             window,
             known: HashMap::new(),
             correspondents: HashMap::new(),
+            posted: HashMap::new(),
         }
     }
 
@@ -101,6 +127,44 @@ impl Replies {
         self.known.insert(key(event, network), (message, now));
     }
 
+    /// The same fact the other way round: where on Matrix a mesh message ended
+    /// up. A reaction arrives naming the mesh message, and this is what turns
+    /// that into something to annotate.
+    ///
+    /// `excerpt` is what may be quoted back when the reaction is relayed as
+    /// text. Pass `None` for a direct message: its text is not repeated in a
+    /// room or a log, and a reaction to one is relayed as a reaction anyway.
+    pub fn remember_posted(
+        &mut self,
+        network: &str,
+        message: &MessageRef,
+        posted: Posted,
+        now: Instant,
+    ) {
+        self.prune(now);
+        self.posted
+            .insert(posted_key(network, message, &posted.room), (posted, now));
+    }
+
+    /// Where a mesh message was posted, looked for in each of `rooms`.
+    ///
+    /// A channel message went to exactly one room; a direct message went to
+    /// every inbox listening, and a reaction to it belongs in all of them.
+    pub fn posted_in(
+        &self,
+        network: &str,
+        message: &MessageRef,
+        rooms: &[String],
+        now: Instant,
+    ) -> Vec<Posted> {
+        rooms
+            .iter()
+            .filter_map(|room| self.posted.get(&posted_key(network, message, room)))
+            .filter(|(_, at)| now.duration_since(*at) < self.window)
+            .map(|(posted, _)| posted.clone())
+            .collect()
+    }
+
     /// What to name on `network` in order to reply to `event`, if we still know.
     ///
     /// Reading does not forget: the same original may be answered many times.
@@ -123,8 +187,11 @@ impl Replies {
             .retain(|_, (_, at)| now.duration_since(*at) < window);
         self.correspondents
             .retain(|_, (_, at)| now.duration_since(*at) < window);
+        self.posted
+            .retain(|_, (_, at)| now.duration_since(*at) < window);
         trim(&mut self.known);
         trim(&mut self.correspondents);
+        trim(&mut self.posted);
     }
 
     #[cfg(test)]

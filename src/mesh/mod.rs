@@ -122,6 +122,9 @@ impl fmt::Display for MessageRef {
 /// to wait for rather than what happened.
 #[derive(Debug)]
 pub struct Delivery {
+    /// What the message went out as, so a reaction to it can be recognized when
+    /// it comes back. `None` on a protocol with nothing to name.
+    pub reference: Option<MessageRef>,
     /// `true` once the far node has acknowledged. `false` if the mesh said
     /// outright that it could not be delivered, which is worth knowing early
     /// rather than waiting out the timeout for.
@@ -184,6 +187,13 @@ pub struct IncomingMesh {
     /// nothing to name it by, which on MeshCore is any message whose sender we
     /// could not recover from the text.
     pub reference: Option<MessageRef>,
+    /// Set when this is not a message at all but a reaction to one, naming what
+    /// it is a reaction to. The text is then the emoji itself.
+    ///
+    /// Only Meshtastic has these: a tapback is an ordinary text packet with
+    /// `emoji` set, which is the only thing telling it apart from somebody
+    /// typing a thumbs-up on its own.
+    pub reacts_to: Option<MessageRef>,
 }
 
 impl IncomingMesh {
@@ -299,6 +309,7 @@ mod tests {
             sender: None,
             text: "hi".to_owned(),
             reference: None,
+            reacts_to: None,
         };
         assert_eq!(direct.channel(), None);
 

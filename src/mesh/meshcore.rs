@@ -288,6 +288,9 @@ impl MeshCoreBackend {
                         .map(MessageRef::Author),
                     sender,
                     text,
+                    // MeshCore has no tapbacks. An emoji here is somebody typing
+                    // one, which is a message like any other.
+                    reacts_to: None,
                 })
             }
             EventPayload::ContactMessage(message) => {
@@ -304,6 +307,7 @@ impl MeshCoreBackend {
                     // A direct message is a conversation of two, where naming
                     // what you answer says nothing the address does not.
                     reference: None,
+                    reacts_to: None,
                 })
             }
             // A direct message of ours reached the far node. The tag is the one
@@ -544,6 +548,9 @@ impl MeshBackend for MeshCoreBackend {
             Err(_) => warn!(network = %self.id, "the pending-ack lock is poisoned"),
         }
         Ok(Delivery {
+            // Nothing on the wire another client could point back at, so nothing
+            // can be a reaction to it either.
+            reference: None,
             ack,
             within: Duration::from_millis(u64::from(sent.suggested_timeout)),
         })

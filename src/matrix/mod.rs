@@ -17,6 +17,26 @@ pub type RoomId = String;
 /// Identifier of a Matrix event, which is what a reply names.
 pub type EventId = String;
 
+/// What kind of message to post.
+///
+/// A relayed mesh message is text, as anything somebody typed should be. An
+/// emote is the relay speaking *about* the mesh rather than for it — clients
+/// render it in the third person, which is exactly what "BOB reacted 👍" is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MsgKind {
+    Text,
+    Emote,
+}
+
+impl MsgKind {
+    fn msgtype(self) -> &'static str {
+        match self {
+            MsgKind::Text => "m.text",
+            MsgKind::Emote => "m.emote",
+        }
+    }
+}
+
 /// A text message observed in a bridged room.
 #[derive(Clone, Debug)]
 pub struct MatrixMessage {
@@ -43,7 +63,7 @@ pub trait MatrixSink: Send + Sync {
 
     /// Post a message and report the id the server gave it, which is what ties
     /// it to whatever came back over the mesh.
-    async fn send_text(&self, room_id: &str, body: &str) -> Result<EventId>;
+    async fn send(&self, room_id: &str, body: &str, kind: MsgKind) -> Result<EventId>;
 
     /// Annotate an event with a short key, which clients show as a reaction.
     ///

@@ -23,12 +23,12 @@ use tracing::{debug, info, warn};
 
 use crate::config::{Config, RelayConfig, Route};
 use crate::dedupe::{Dedupe, message_key};
-use crate::matrix::{MatrixMessage, MatrixSink, RoomId};
+use crate::matrix::{MatrixMessage, MatrixSink, MsgKind, RoomId};
 use crate::mesh::{
     Delivery, IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin, PeerId, Sender,
 };
 use crate::prefix::{self, Vars};
-use crate::replies::Replies;
+use crate::replies::{Posted, Replies};
 
 /// Marks put on an answer written in a DM inbox, once the mesh has had its say.
 /// A tick is the far node confirming; the warning covers both a mesh that said it
@@ -250,7 +250,32 @@ impl Router {
 
     /// Handle one message received from a mesh network.
     pub async fn handle_mesh(&self, message: IncomingMesh, now: Instant) {
-        let key = message_key(&message.network, message.channel(), &message.text);
+        // A reaction is a couple of bytes of emoji, so two people agreeing with
+        // the same message produce identical text and the second would be thrown
+        // away as a duplicate. What it is about and who sent it are what make it
+        // its own reaction.
+        //
+        // Naming the sender is safe here in a way it is not for messages: only
+        // Meshtastic has reactions, and a Meshtastic packet always says who it is
+        // from. A duplicate of the same reaction — the same node reaching us
+        // twice, over LoRa and over MQTT — still collapses, which is the point.
+        let key = match &message.reacts_to {
+            Some(about) => message_key(
+                &message.network,
+                message.channel(),
+                &format!(
+                    "{about}\u{0}{}\u{0}{}",
+                    message
+                        .sender
+                        .as_ref()
+                        .and_then(|sender| sender.id.as_ref())
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                    message.text
+                ),
+            ),
+            None => message_key(&message.network, message.channel(), &message.text),
+        };
         if !self.dedupe.lock().await.admit(key, now) {
             debug!(
                 network = %message.network,
@@ -259,9 +284,107 @@ impl Router {
             return;
         }
 
+        if message.reacts_to.is_some() {
+            self.relay_reaction(&message, now).await;
+            return;
+        }
+
         match &message.origin {
             Origin::Channel(channel) => self.relay_channel(&message, *channel, now).await,
             Origin::Direct(peer) => self.relay_direct(&message, peer, now).await,
+        }
+    }
+
+    /// Put a tapback from the mesh onto the message it is about.
+    ///
+    /// How depends on where, and the difference is not cosmetic. In a **direct
+    /// message** the conversation has two ends, so the only person who could
+    /// have reacted is the one at the other one: a real `m.reaction` says
+    /// everything, and nothing is lost by the relay being the account that posts
+    /// it.
+    ///
+    /// A **channel** has many people on it, and there Matrix works against us. A
+    /// reaction is identified by who sent it, what it is on and what it says, and
+    /// every reaction the relay posts is from the same account — so two people
+    /// sending the same emoji collapse into one, and either way the room shows
+    /// the relay reacting rather than them. Bridges solve this by registering as
+    /// an appservice and puppeting a Matrix user per node, which is a different
+    /// kind of program from this one. So a channel reaction is relayed as an
+    /// emote instead, which says plainly who reacted and to what.
+    async fn relay_reaction(&self, message: &IncomingMesh, now: Instant) {
+        let Some(about) = &message.reacts_to else {
+            return;
+        };
+        let rooms = self.rooms_showing(message);
+        if rooms.is_empty() {
+            debug!(network = %message.network, "a reaction in a place we do not bridge");
+            return;
+        }
+
+        let seen = self
+            .replies
+            .lock()
+            .await
+            .posted_in(&message.network, about, &rooms, now);
+        if seen.is_empty() {
+            debug!(
+                network = %message.network,
+                "a reaction to a message we no longer know, dropping"
+            );
+            return;
+        }
+
+        let names = self.names_of(message.sender.as_ref());
+        for posted in seen {
+            let result = match message.origin {
+                // One conversation, one possible reactor.
+                Origin::Direct(_) => {
+                    self.matrix
+                        .react(&posted.room, &posted.event, &message.text)
+                        .await
+                }
+                Origin::Channel(_) => {
+                    let about = match &posted.excerpt {
+                        Some(excerpt) => format!(" to \"{excerpt}\""),
+                        // Known well enough to place, not well enough to quote.
+                        None => String::new(),
+                    };
+                    let body = format!("{} reacted {}{about}", names.name, message.text);
+                    self.matrix
+                        .send(&posted.room, &body, MsgKind::Emote)
+                        .await
+                        .map(|_| ())
+                }
+            };
+            match result {
+                Ok(()) => info!(
+                    network = %message.network,
+                    room = %posted.room,
+                    sender = %names.name,
+                    "reaction -> matrix"
+                ),
+                Err(error) => warn!(room = %posted.room, %error, "failed to relay a reaction"),
+            }
+        }
+    }
+
+    /// The rooms a message from this network could have been shown in.
+    fn rooms_showing(&self, message: &IncomingMesh) -> Vec<RoomId> {
+        match message.origin {
+            Origin::Channel(channel) => self
+                .inbound
+                .get(&message.network)
+                .and_then(|channels| channels.get(&channel))
+                .cloned()
+                .into_iter()
+                .collect(),
+            // A direct message goes to every inbox listening to its network, and
+            // a reaction to it belongs in all of them.
+            Origin::Direct(_) => self
+                .dm_inboxes
+                .get(&message.network)
+                .map(|targets| targets.iter().map(|target| target.room.clone()).collect())
+                .unwrap_or_default(),
         }
     }
 
@@ -287,7 +410,7 @@ impl Router {
             message.text
         );
 
-        let event = match self.matrix.send_text(room, &body).await {
+        let event = match self.matrix.send(room, &body, MsgKind::Text).await {
             Ok(event) => {
                 info!(
                     network = %message.network,
@@ -301,10 +424,20 @@ impl Router {
                 // answer written in Matrix can point back at what the mesh calls
                 // it.
                 if let Some(reference) = message.reference.clone() {
-                    self.replies
-                        .lock()
-                        .await
-                        .remember(&event, &message.network, reference, now);
+                    let mut replies = self.replies.lock().await;
+                    replies.remember(&event, &message.network, reference.clone(), now);
+                    // And the other way round, so a reaction arriving later can
+                    // be put on this message and quote it.
+                    replies.remember_posted(
+                        &message.network,
+                        &reference,
+                        Posted {
+                            room: room.to_owned(),
+                            event: event.clone(),
+                            excerpt: Some(excerpt(&message.text)),
+                        },
+                        now,
+                    );
                 }
                 Some(event)
             }
@@ -419,7 +552,7 @@ impl Router {
                 prefix::render(template, &names.vars(&message.network, &tag, None)),
                 message.text
             );
-            match self.matrix.send_text(&target.room, &body).await {
+            match self.matrix.send(&target.room, &body, MsgKind::Text).await {
                 // Who and where, but not what. A direct message was addressed
                 // to this node and to nobody else, and a log is a place text
                 // outlives the room it was meant for.
@@ -433,12 +566,22 @@ impl Router {
                     );
                     // Which is what makes answering it possible: a reply to this
                     // event is a reply to this person, on this network.
-                    self.replies.lock().await.remember_correspondent(
-                        &event,
-                        &message.network,
-                        peer,
-                        now,
-                    );
+                    let mut replies = self.replies.lock().await;
+                    replies.remember_correspondent(&event, &message.network, peer, now);
+                    if let Some(reference) = message.reference.clone() {
+                        replies.remember_posted(
+                            &message.network,
+                            &reference,
+                            Posted {
+                                room: target.room.clone(),
+                                event,
+                                // Never quoted back: a direct message is not
+                                // repeated anywhere it was not already sent.
+                                excerpt: None,
+                            },
+                            now,
+                        );
+                    }
                 }
                 Err(error) => {
                     warn!(room = %target.room, %error, "failed to mirror a direct message")
@@ -500,6 +643,20 @@ impl Router {
                     bytes = payload.len(),
                     "matrix -> direct message"
                 );
+                if let Some(reference) = delivery.reference.clone() {
+                    // What we just said is also something the far node may react
+                    // to, and its reaction belongs on the message written here.
+                    self.replies.lock().await.remember_posted(
+                        &network,
+                        &reference,
+                        Posted {
+                            room: message.room_id.clone(),
+                            event: message.event_id.clone(),
+                            excerpt: None,
+                        },
+                        now,
+                    );
+                }
                 self.confirm(delivery, &message.room_id, &message.event_id, network, who);
             }
             Err(error) => warn!(
@@ -715,6 +872,21 @@ fn require_backend(
     }
 }
 
+/// Enough of a message to recognize it when it is quoted back, and no more:
+/// a reaction relayed as text spends a Matrix line, not a LoRa payload, but a
+/// whole message quoted under every thumbs-up reads as noise.
+///
+/// Cut on a character boundary, since mesh text is UTF-8 and cutting mid-emoji
+/// would produce a body no client can render.
+fn excerpt(text: &str) -> String {
+    const LIMIT: usize = 40;
+    if text.chars().count() <= LIMIT {
+        return text.to_owned();
+    }
+    let short: String = text.chars().take(LIMIT).collect();
+    format!("{}…", short.trim_end())
+}
+
 /// `@alice:example.org` -> `alice`. Display names would need another API call
 /// and a cache; the localpart is stable and good enough for a mesh prefix.
 fn matrix_localpart(user_id: &str) -> &str {
@@ -854,6 +1026,8 @@ mod tests {
             // Short, because a test that waits out a real mesh timeout is a test
             // nobody runs.
             Ok(Delivery {
+                reference: (self.kind == MeshKind::Meshtastic)
+                    .then(|| MessageRef::Packet(DM_PACKET)),
                 ack,
                 within: Duration::from_millis(50),
             })
@@ -867,6 +1041,7 @@ mod tests {
     struct FakeSink {
         sent: Mutex<Vec<(String, String)>>,
         reactions: Mutex<Vec<(String, String)>>,
+        emotes: Mutex<Vec<String>>,
     }
 
     impl FakeSink {
@@ -874,11 +1049,17 @@ mod tests {
             Arc::new(Self {
                 sent: Mutex::new(Vec::new()),
                 reactions: Mutex::new(Vec::new()),
+                emotes: Mutex::new(Vec::new()),
             })
         }
 
         async fn sent(&self) -> Vec<(String, String)> {
             self.sent.lock().await.clone()
+        }
+
+        /// Every emote posted, body only.
+        async fn emotes(&self) -> Vec<String> {
+            self.emotes.lock().await.clone()
         }
 
         /// Every annotation posted, as `(event, key)`.
@@ -919,7 +1100,10 @@ mod tests {
             Ok(())
         }
 
-        async fn send_text(&self, room_id: &str, body: &str) -> Result<String> {
+        async fn send(&self, room_id: &str, body: &str, kind: MsgKind) -> Result<String> {
+            if kind == MsgKind::Emote {
+                self.emotes.lock().await.push(body.to_owned());
+            }
             let mut sent = self.sent.lock().await;
             sent.push((room_id.to_owned(), body.to_owned()));
             Ok(Self::event_id(sent.len()))
@@ -1008,17 +1192,23 @@ mod tests {
         MessageRef::Packet(0xbeef)
     }
 
+    /// And the one a Meshtastic-shaped fake says its direct messages went out as.
+    const DM_PACKET: u32 = 0xd1;
+
     fn from_mesh(network: &str, channel: u8, name: Option<&str>, text: &str) -> IncomingMesh {
         IncomingMesh {
             network: network.to_owned(),
             origin: Origin::Channel(channel),
             sender: name.map(|name| Sender {
-                id: Some(PeerId::Node(1)),
+                // Derived from the name, so two senders in one test are two
+                // different nodes — which is what tells their reactions apart.
+                id: Some(PeerId::Node(u32::from(name.as_bytes()[0]))),
                 long_name: Some(name.to_owned()),
                 short_name: None,
             }),
             text: text.to_owned(),
             reference: Some(mesh_packet()),
+            reacts_to: None,
         }
     }
 
@@ -1028,6 +1218,15 @@ mod tests {
         IncomingMesh {
             reference: Some(MessageRef::Author(name.to_owned())),
             ..from_mesh(network, channel, Some(name), text)
+        }
+    }
+
+    /// A tapback: an emoji, and what it is about.
+    fn reacting(base: IncomingMesh, about: MessageRef, emoji: &str) -> IncomingMesh {
+        IncomingMesh {
+            text: emoji.to_owned(),
+            reacts_to: Some(about),
+            ..base
         }
     }
 
@@ -1152,6 +1351,7 @@ mod tests {
                     }),
                     text: "hola".to_owned(),
                     reference: Some(mesh_packet()),
+                    reacts_to: None,
                 },
                 Instant::now(),
             )
@@ -1170,6 +1370,7 @@ mod tests {
                     }),
                     text: "bos dias".to_owned(),
                     reference: Some(MessageRef::Author("EA1HYZ".to_owned())),
+                    reacts_to: None,
                 },
                 Instant::now(),
             )
@@ -1557,7 +1758,9 @@ mod tests {
                 short_name: None,
             }),
             text: text.to_owned(),
-            reference: None,
+            // Meshtastic packets carry an id; MeshCore direct messages do not.
+            reference: (network == "lora").then(mesh_packet),
+            reacts_to: None,
         }
     }
 
@@ -1640,6 +1843,159 @@ mod tests {
             h.mc.sent().await.is_empty(),
             "an inbox never reaches a channel"
         );
+    }
+
+    /// On a channel a reaction cannot be relayed as one — every reaction the
+    /// relay posts comes from the same account, so two people agreeing would
+    /// collapse into one and neither would be named. An emote says both.
+    #[tokio::test]
+    async fn a_channel_reaction_becomes_an_emote_naming_who_and_what() {
+        let h = harness(ONE_ROOM);
+        let now = Instant::now();
+        h.router
+            .handle_mesh(from_mesh("lora", 0, Some("Alice"), "llego en 10 min"), now)
+            .await;
+        h.router
+            .handle_mesh(
+                reacting(from_mesh("lora", 0, Some("Bob"), ""), mesh_packet(), "👍"),
+                now,
+            )
+            .await;
+
+        assert_eq!(
+            h.sink.emotes().await,
+            ["Bob reacted 👍 to \"llego en 10 min\"".to_owned()]
+        );
+        assert!(
+            h.sink.reactions().await.is_empty(),
+            "a real reaction would lose who sent it"
+        );
+    }
+
+    /// Two people agreeing with the same message. As text they are identical, so
+    /// the duplicate cache has to tell them apart by what they are about.
+    #[tokio::test]
+    async fn two_people_reacting_alike_are_both_relayed() {
+        let h = harness(ONE_ROOM);
+        let now = Instant::now();
+        h.router
+            .handle_mesh(from_mesh("lora", 0, Some("Alice"), "llego en 10 min"), now)
+            .await;
+        for who in ["Bob", "Carlos"] {
+            h.router
+                .handle_mesh(
+                    reacting(from_mesh("lora", 0, Some(who), ""), mesh_packet(), "👍"),
+                    now + Duration::from_secs(1),
+                )
+                .await;
+        }
+
+        assert_eq!(
+            h.sink.emotes().await.len(),
+            2,
+            "the second must not be swallowed as a duplicate"
+        );
+    }
+
+    /// In a direct message there is only one person who could have reacted, so a
+    /// real reaction says everything and costs the room no extra line.
+    #[tokio::test]
+    async fn a_reaction_to_a_direct_message_is_a_real_reaction() {
+        let h = harness(DM_ROOMS);
+        let now = Instant::now();
+        // Meshtastic, since it is the only protocol with tapbacks.
+        h.router
+            .handle_mesh(direct("lora", Some("Alice"), "estas ahi?"), now)
+            .await;
+        h.router
+            .handle_mesh(
+                reacting(direct("lora", Some("Alice"), ""), mesh_packet(), "👍"),
+                now,
+            )
+            .await;
+
+        let marked = h.sink.reactions().await;
+        assert_eq!(
+            marked,
+            [(FakeSink::event_id(1), "👍".to_owned())],
+            "it goes on the mirrored message, in the inbox listening to lora"
+        );
+        assert!(
+            h.sink.emotes().await.is_empty(),
+            "no emote is needed where there is only one possible reactor"
+        );
+    }
+
+    /// The relay's own answer is also something the far node can react to.
+    #[tokio::test]
+    async fn a_reaction_to_our_own_answer_lands_on_the_message_that_wrote_it() {
+        let h = harness(DM_ROOMS);
+        let now = Instant::now();
+        h.router
+            .handle_mesh(direct("lora", Some("Alice"), "estas ahi?"), now)
+            .await;
+        h.router
+            .handle_matrix(
+                replying_to(
+                    &FakeSink::event_id(1),
+                    "!dm:example.org",
+                    "@bob:example.org",
+                    "aqui estoy",
+                ),
+                now,
+            )
+            .await;
+        h.sink.reactions.lock().await.clear();
+
+        h.router
+            .handle_mesh(
+                reacting(
+                    direct("lora", Some("Alice"), ""),
+                    MessageRef::Packet(DM_PACKET),
+                    "👍",
+                ),
+                now,
+            )
+            .await;
+
+        assert_eq!(
+            h.sink.reactions().await,
+            [("$typed:example.org".to_owned(), "👍".to_owned())],
+            "it belongs on the answer written in Matrix, not on the original"
+        );
+    }
+
+    /// Older than the window, or from before a restart: there is nothing to
+    /// attach it to, and a bare emoji in the room would say nothing.
+    #[tokio::test]
+    async fn a_reaction_to_something_forgotten_is_dropped() {
+        let h = harness(ONE_ROOM);
+        h.router
+            .handle_mesh(
+                reacting(
+                    from_mesh("lora", 0, Some("Bob"), ""),
+                    MessageRef::Packet(0x1234),
+                    "👍",
+                ),
+                Instant::now(),
+            )
+            .await;
+
+        assert!(h.sink.sent().await.is_empty());
+        assert!(h.sink.emotes().await.is_empty());
+        assert!(h.sink.reactions().await.is_empty());
+    }
+
+    /// A long message is not quoted whole under every thumbs-up.
+    #[test]
+    fn an_excerpt_is_cut_on_a_character_boundary() {
+        assert_eq!(excerpt("corto"), "corto");
+        let long = "ñ".repeat(60);
+        let cut = excerpt(&long);
+        assert_eq!(cut.chars().count(), 41, "forty characters and an ellipsis");
+        assert!(cut.ends_with('…'));
+        // Emoji are several bytes each, and cutting one in half is unrenderable.
+        assert!(excerpt(&"👍".repeat(60)).starts_with("👍👍"));
     }
 
     /// A direct message is the one thing here that can be confirmed to have

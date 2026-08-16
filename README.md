@@ -32,9 +32,11 @@ arriving back and being parsed, and 80 real Matrix events read.
 - Replies: answering a message in Matrix reaches the mesh as a reply to that
   message, in whichever way the protocol there expresses one.
 
-Deliberately out of scope: media, plugins, message history, and relaying
-reactions in either direction — the relay posts one of its own to confirm a
-direct message, and that is the only reaction it deals in.
+- Reactions from Meshtastic reach Matrix, as a reaction where that says the
+  truth and as an emote where it would not.
+
+Deliberately out of scope: media, plugins, message history, and reactions
+written in Matrix travelling to the mesh.
 
 End-to-end encrypted Matrix rooms are **not** supported yet. The Matrix side sits
 behind a five-method trait so an implementation backed by `matrix-sdk` can be
@@ -197,6 +199,40 @@ as a warning and nowhere else.
 Direct messages stay out of the log in both directions: the lines carry who,
 where and how many bytes, never the text. A log outlives the room a private
 message was meant for.
+
+### Reactions, and why they are not always reactions
+
+Meshtastic has tapbacks: a thumbs-up on a message is an ordinary text packet
+with `emoji` set and `reply_id` naming what it is about. MeshCore has nothing of
+the kind, so all of this is Meshtastic only.
+
+Relaying one **as** a Matrix reaction is only honest in a direct message. A
+reaction there is identified by who sent it, what it is on and what it says, and
+every reaction the relay posts comes from the relay's own account. On a channel
+that breaks twice over: two people sending 👍 collapse into a single reaction,
+and the room shows the relay reacting rather than either of them. Bridges that
+get this right register as an appservice and puppet one Matrix user per node,
+which is a different kind of program from this one.
+
+So it depends on where:
+
+- **In a channel**, an emote — `Bob reacted 👍 to "llego en 10 min"`. It says who
+  and what, and reads the same in every client. The quote is an excerpt, forty
+  characters and an ellipsis, because a whole message under every thumbs-up is
+  noise.
+- **In a DM inbox**, a real `m.reaction` on the mirrored message. A direct
+  message has two ends, so there is only one person the reaction could be from
+  and nothing is lost. That includes reacting to an answer *you* wrote from
+  Matrix.
+
+A reaction to something the relay no longer remembers is dropped: a bare emoji
+with nothing to attach it to says less than nothing. Reactions are not fanned
+out to other meshes either — spending LoRa airtime on a thumbs-up is not worth
+it, and the convention does not exist on the other side.
+
+One consequence worth knowing: duplicate suppression keys a reaction on what it
+is about *and who sent it*, not just its text. Two people agreeing with the same
+message inside the window would otherwise look like the same message twice.
 
 ### Whether it arrived
 
