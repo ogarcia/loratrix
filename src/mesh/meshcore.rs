@@ -26,7 +26,9 @@ use tokio::time::{Instant, sleep, sleep_until};
 use tracing::{debug, info, trace, warn};
 
 use crate::config::{NetworkConfig, NetworkKind, Transport};
-use crate::mesh::{IncomingMesh, MeshBackend, MeshKind, NetworkId, Origin, PeerId, Sender};
+use crate::mesh::{
+    IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin, PeerId, Sender,
+};
 
 /// Conservative text budget. MeshCore does not expose a payload constant the way
 /// Meshtastic's protobufs do, so this is a floor picked to be safe rather than a
@@ -47,6 +49,16 @@ const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(60);
 /// of them on the mesh this was written against — so a stranger sending several
 /// messages must not cost one fetch each.
 const NAME_REFRESH_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// How a MeshCore client marks a reply. The protocol has no field for it, so the
+/// convention is the same one that carries the sender's name: it goes in the
+/// text, at the head of the answer.
+///
+/// ```text
+/// ALICE: Hola a todos
+/// BOB: @[ALICE] Hola Alice
+/// ```
+const REPLY_OPEN: &str = "@[";
 
 /// Longest thing we will believe is a name. The advertised names on the mesh this
 /// was written against run to about twenty five characters; well past that and
@@ -248,6 +260,14 @@ impl MeshCoreBackend {
                 Some(IncomingMesh {
                     network: self.id.clone(),
                     origin: Origin::Channel(message.channel_idx),
+                    // A reply here points at the person, because that is the only
+                    // thing a MeshCore channel message says about itself. Which
+                    // also means a message whose name we could not recover cannot
+                    // be replied to at all.
+                    reference: sender
+                        .as_ref()
+                        .and_then(|sender| sender.long_name.clone())
+                        .map(MessageRef::Author),
                     sender,
                     text,
                 })
@@ -263,6 +283,9 @@ impl MeshCoreBackend {
                         short_name: None,
                     }),
                     text: message.text.clone(),
+                    // A direct message is a conversation of two, where naming
+                    // what you answer says nothing the address does not.
+                    reference: None,
                 })
             }
             _ => {
@@ -419,7 +442,25 @@ impl MeshBackend for MeshCoreBackend {
         }
     }
 
-    async fn send_channel(&self, channel: u8, text: &str) -> Result<()> {
+    fn reply_marker(&self, to: &MessageRef) -> Option<String> {
+        match to {
+            MessageRef::Author(name) => Some(format!("{REPLY_OPEN}{name}] ")),
+            // Not something this protocol can name. Nothing is written, and the
+            // message goes out as an ordinary one.
+            MessageRef::Packet(_) => None,
+        }
+    }
+
+    /// `reply_to` is not read here, and does not need to be: on MeshCore the
+    /// marker is part of the text, so the router has already written it in — see
+    /// [`MeshBackend::reply_marker`]. Doing it at this end would add bytes to a
+    /// payload that has already been measured and cut to fit.
+    async fn send_channel(
+        &self,
+        channel: u8,
+        text: &str,
+        _reply_to: Option<MessageRef>,
+    ) -> Result<Option<MessageRef>> {
         let client = self.connected().await?;
         self.pace().await;
         client
@@ -430,7 +471,13 @@ impl MeshBackend for MeshCoreBackend {
             .await
             .send_channel_msg(channel, text, None)
             .await
-            .with_context(|| format!("sending on {} channel {channel}", self.id))
+            .with_context(|| format!("sending on {} channel {channel}", self.id))?;
+
+        // What a reply to this would have to name, read back out of the text the
+        // same way a received message is read. Whatever the prefix template put
+        // there is what other clients will show as the sender, so it is also what
+        // they will answer.
+        Ok(split_sender(text).map(|(name, _)| MessageRef::Author(name.to_owned())))
     }
 
     async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<()> {
@@ -532,7 +579,7 @@ mod tests {
         });
 
         let error = backend
-            .send_channel(0, "hola")
+            .send_channel(0, "hola", None)
             .await
             .expect_err("sending without a link must fail");
         assert!(error.to_string().contains("not connected"), "{error}");
@@ -959,7 +1006,7 @@ mod tests {
 
         println!("sending {text:?} on channel {channel} ({wanted})");
         backend
-            .send_channel(channel, &text)
+            .send_channel(channel, &text, None)
             .await
             .expect("the radio should accept the message");
         println!("the radio accepted it");

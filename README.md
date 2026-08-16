@@ -28,8 +28,10 @@ arriving back and being parsed, and 80 real Matrix events read.
 - Optional read-only DM inbox: direct messages sent to the relay's node are
   mirrored into a Matrix room where you can read them but not answer.
 - Duplicate and echo suppression, so bridged meshes do not loop.
+- Replies: answering a message in Matrix reaches the mesh as a reply to that
+  message, in whichever way the protocol there expresses one.
 
-Deliberately out of scope: reactions, replies, media, plugins, message history.
+Deliberately out of scope: reactions, media, plugins, message history.
 
 End-to-end encrypted Matrix rooms are **not** supported yet. The Matrix side sits
 behind a four-method trait so an implementation backed by `matrix-sdk` can be
@@ -135,6 +137,42 @@ attached nothing else can be. If you want to keep using a phone app against the
 same radio, put a multiplexer in front of it — for MeshCore,
 [coresplitter](https://github.com/ogarcia/coresplitter) does exactly that — and
 point `transport` at the multiplexer instead.
+
+## Replies are two conventions, not one feature
+
+Answer a message in Matrix and the answer reaches the mesh as an answer. What
+that means differs by protocol, in the same way sender identity does.
+
+- **Meshtastic** has a field for it. The packet carries the id of the one it
+  replies to, and it costs the text nothing.
+- **MeshCore** has no such field, so its clients do what they already do with
+  the sender's name and write it into the text:
+
+  ```text
+  ALICE: Hola a todos
+  BOB: @[ALICE] Hola Alice
+  ```
+
+  Which points at the person rather than at the message, that being all the
+  protocol says. It also spends payload, so the marker is counted before the
+  text is cut to fit — otherwise a reply would lose exactly the room the marker
+  takes.
+
+Tying the two together needs a memory of which mesh message each Matrix event
+is. It is held in memory, keyed by event *and network* — one event bridged to
+two meshes is two different messages — and entries expire after
+`reply_window_secs`, twelve hours by default. Reading one does not remove it: a
+message may be answered many times.
+
+Answering something the relay no longer remembers, or that never reached that
+mesh, is not an error. The message is delivered plainly, without its thread.
+
+Matrix clients also quote the original into the body of a reply, as `> <@user>`
+lines. That fallback is dropped before the text goes out, because on a payload
+of a couple of hundred bytes the quote is charged against the answer.
+
+The other direction — a reply written on the mesh arriving in Matrix as a rich
+reply — is not implemented.
 
 ## A hop limit of zero is not a default
 

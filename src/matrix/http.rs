@@ -31,7 +31,7 @@ use tokio::time::sleep;
 use tracing::{debug, info, trace, warn};
 
 use crate::config::MatrixConfig;
-use crate::matrix::{MatrixMessage, MatrixSink, RoomId};
+use crate::matrix::{EventId, MatrixMessage, MatrixSink, RoomId};
 
 /// How long the server may hold a `/sync` open waiting for something to happen.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -181,10 +181,25 @@ impl HttpSink {
             return None;
         }
 
+        let reply_to = event
+            .content
+            .relates_to
+            .as_ref()
+            .and_then(|relation| relation.in_reply_to.as_ref())
+            .map(|reply| reply.event_id.clone());
+        // Only a reply can be carrying a quote, and only then is it safe to go
+        // looking for one.
+        let body = match reply_to {
+            Some(_) => super::strip_reply_fallback(body),
+            None => body,
+        };
+
         Some(MatrixMessage {
             room_id: room.to_owned(),
             sender: event.sender.clone(),
             body: body.to_owned(),
+            event_id: event.event_id.clone(),
+            reply_to,
         })
     }
 
@@ -318,7 +333,7 @@ impl MatrixSink for HttpSink {
         }
     }
 
-    async fn send_text(&self, room_id: &str, body: &str) -> Result<()> {
+    async fn send_text(&self, room_id: &str, body: &str) -> Result<EventId> {
         let url = format!(
             "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
             self.homeserver,
@@ -339,13 +354,22 @@ impl MatrixSink for HttpSink {
             let error = response.text().await.unwrap_or_default();
             bail!("sending to {room_id} failed with {status}: {error}");
         }
-        Ok(())
+        let sent: SendResponse = response
+            .json()
+            .await
+            .with_context(|| format!("reading what {room_id} called the event we sent"))?;
+        Ok(sent.event_id)
     }
 }
 
 #[derive(Deserialize)]
 struct JoinResponse {
     room_id: String,
+}
+
+#[derive(Deserialize)]
+struct SendResponse {
+    event_id: String,
 }
 
 #[derive(Deserialize)]
@@ -378,6 +402,7 @@ struct TimelineEvent {
     #[serde(rename = "type")]
     kind: String,
     sender: String,
+    event_id: String,
     #[serde(default)]
     content: EventContent,
 }
@@ -388,6 +413,21 @@ struct EventContent {
     msgtype: Option<String>,
     #[serde(default)]
     body: Option<String>,
+    /// How this event relates to another. Only `m.in_reply_to` is read; edits,
+    /// annotations and threads are relations we have nowhere to put.
+    #[serde(default, rename = "m.relates_to")]
+    relates_to: Option<Relation>,
+}
+
+#[derive(Deserialize)]
+struct Relation {
+    #[serde(default, rename = "m.in_reply_to")]
+    in_reply_to: Option<InReplyTo>,
+}
+
+#[derive(Deserialize)]
+struct InReplyTo {
+    event_id: String,
 }
 
 /// Percent-encode a single URL path segment.
@@ -654,9 +694,9 @@ mod tests {
         let timeline = r#"{
             "next_batch": "s2",
             "rooms": { "join": { "!room:example.org": { "timeline": { "events": [
-                { "type": "m.room.message", "sender": "@relay:example.org",
+                { "type": "m.room.message", "event_id": "$e", "sender": "@relay:example.org",
                   "content": { "msgtype": "m.text", "body": "our own echo" } },
-                { "type": "m.room.message", "sender": "@alice:example.org",
+                { "type": "m.room.message", "event_id": "$e", "sender": "@alice:example.org",
                   "content": { "msgtype": "m.text", "body": "hola" } }
             ] } } } }
         }"#;
@@ -694,6 +734,50 @@ mod tests {
         assert!(requests[2].contains("since=s1"), "{}", requests[2]);
     }
 
+    /// A rich reply, as a client really sends one: the relation in `m.relates_to`
+    /// and the original quoted into the body. Both matter — the relation is what
+    /// lets the mesh thread it, and the quote is what must not be spent on a LoRa
+    /// payload.
+    #[tokio::test]
+    async fn a_reply_carries_its_relation_and_loses_its_quote() {
+        let timeline = r#"{
+            "next_batch": "s2",
+            "rooms": { "join": { "!room:example.org": { "timeline": { "events": [
+                { "type": "m.room.message", "event_id": "$answer", "sender": "@bob:example.org",
+                  "content": { "msgtype": "m.text",
+                               "body": "> <@alice:example.org> hola a todos\n\nbuenas Alice",
+                               "m.relates_to": { "m.in_reply_to": { "event_id": "$original" } } } }
+            ] } } } }
+        }"#;
+        let server = FakeHomeserver::start(vec![
+            ok(r#"{"room_id":"!room:example.org"}"#),
+            ok(r#"{"next_batch":"s1"}"#),
+            ok(timeline),
+        ])
+        .await;
+        let sink = server.sink();
+        sink.join_rooms(&["!room:example.org".to_owned()])
+            .await
+            .expect("joining should succeed");
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let running = tokio::spawn(async move { sink.run(tx).await });
+
+        let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a message should arrive")
+            .expect("the channel stays open");
+        assert_eq!(message.event_id, "$answer");
+        assert_eq!(message.reply_to.as_deref(), Some("$original"));
+        assert_eq!(
+            message.body, "buenas Alice",
+            "the quoted original must not reach a mesh payload"
+        );
+
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+    }
+
     /// A homeserver that ignores the filter, which is not hypothetical: conduwuit
     /// does exactly this, inline filter or registered one alike. It answers the
     /// priming request with the tail of every room, and relaying that would read
@@ -703,14 +787,14 @@ mod tests {
         let history = r#"{
             "next_batch": "s1",
             "rooms": { "join": { "!room:example.org": { "timeline": { "events": [
-                { "type": "m.room.message", "sender": "@alice:example.org",
+                { "type": "m.room.message", "event_id": "$e", "sender": "@alice:example.org",
                   "content": { "msgtype": "m.text", "body": "said yesterday" } }
             ] } } } }
         }"#;
         let live = r#"{
             "next_batch": "s2",
             "rooms": { "join": { "!room:example.org": { "timeline": { "events": [
-                { "type": "m.room.message", "sender": "@alice:example.org",
+                { "type": "m.room.message", "event_id": "$e", "sender": "@alice:example.org",
                   "content": { "msgtype": "m.text", "body": "said just now" } }
             ] } } } }
         }"#;
@@ -746,11 +830,11 @@ mod tests {
             "next_batch": "s2",
             "rooms": { "join": {
                 "!elsewhere:example.org": { "timeline": { "events": [
-                    { "type": "m.room.message", "sender": "@alice:example.org",
+                    { "type": "m.room.message", "event_id": "$e", "sender": "@alice:example.org",
                       "content": { "msgtype": "m.text", "body": "not our room" } }
                 ] } },
                 "!room:example.org": { "timeline": { "events": [
-                    { "type": "m.room.message", "sender": "@alice:example.org",
+                    { "type": "m.room.message", "event_id": "$e", "sender": "@alice:example.org",
                       "content": { "msgtype": "m.text", "body": "ours" } }
                 ] } }
             } }
@@ -791,23 +875,23 @@ mod tests {
 
         let cases = [
             (
-                r#"{"type":"m.reaction","sender":"@a:x","content":{}}"#,
+                r#"{"type":"m.reaction","event_id":"$e","sender":"@a:x","content":{}}"#,
                 "a reaction",
             ),
             (
-                r#"{"type":"m.room.message","sender":"@relay:example.org","content":{"msgtype":"m.text","body":"hi"}}"#,
+                r#"{"type":"m.room.message","event_id":"$e","sender":"@relay:example.org","content":{"msgtype":"m.text","body":"hi"}}"#,
                 "our own message",
             ),
             (
-                r#"{"type":"m.room.message","sender":"@a:x","content":{"msgtype":"m.image","body":"cat.png"}}"#,
+                r#"{"type":"m.room.message","event_id":"$e","sender":"@a:x","content":{"msgtype":"m.image","body":"cat.png"}}"#,
                 "an image",
             ),
             (
-                r#"{"type":"m.room.message","sender":"@a:x","content":{"msgtype":"m.text","body":""}}"#,
+                r#"{"type":"m.room.message","event_id":"$e","sender":"@a:x","content":{"msgtype":"m.text","body":""}}"#,
                 "an empty body",
             ),
             (
-                r#"{"type":"m.room.message","sender":"@a:x","content":{}}"#,
+                r#"{"type":"m.room.message","event_id":"$e","sender":"@a:x","content":{}}"#,
                 "a redacted message",
             ),
         ];
@@ -827,7 +911,7 @@ mod tests {
 
         for msgtype in ["m.text", "m.notice", "m.emote"] {
             let raw = format!(
-                r#"{{"type":"m.room.message","sender":"@a:x","content":{{"msgtype":"{msgtype}","body":"hola"}}}}"#
+                r#"{{"type":"m.room.message","event_id":"$e","sender":"@a:x","content":{{"msgtype":"{msgtype}","body":"hola"}}}}"#
             );
             let event: TimelineEvent = serde_json::from_str(&raw).expect("valid json");
             let message = sink
@@ -960,7 +1044,7 @@ mod tests {
             ok(r#"{
                 "next_batch": "s3",
                 "rooms": { "join": { "!room:example.org": { "timeline": { "events": [
-                    { "type": "m.room.message", "sender": "@alice:example.org",
+                    { "type": "m.room.message", "event_id": "$e", "sender": "@alice:example.org",
                       "content": { "msgtype": "m.text", "body": "after the error" } }
                 ] } } } }
             }"#),

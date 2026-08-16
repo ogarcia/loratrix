@@ -10,6 +10,7 @@ mod dedupe;
 mod matrix;
 mod mesh;
 mod prefix;
+mod replies;
 mod router;
 
 use std::path::PathBuf;

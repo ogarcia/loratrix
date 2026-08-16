@@ -78,6 +78,12 @@ pub struct RelayConfig {
     /// back, and what absorbs MQTT duplicates on Meshtastic.
     #[serde(default = "default_dedupe_window_secs")]
     pub dedupe_window_secs: u64,
+    /// How long the relay remembers which mesh message a Matrix event is, which
+    /// is what lets a reply be relayed as a reply rather than as a loose remark.
+    /// Beyond this a reply still arrives, only without its thread — which is
+    /// honest, because by then no node remembers the packet it would point at.
+    #[serde(default = "default_reply_window_secs")]
+    pub reply_window_secs: u64,
     /// Prefix prepended to mesh messages on their way into Matrix. Applies to
     /// both protocols; the two below override it for one of them.
     #[serde(default = "default_mesh_to_matrix_prefix")]
@@ -123,6 +129,7 @@ impl Default for RelayConfig {
     fn default() -> Self {
         Self {
             dedupe_window_secs: default_dedupe_window_secs(),
+            reply_window_secs: default_reply_window_secs(),
             mesh_to_matrix_prefix: default_mesh_to_matrix_prefix(),
             meshtastic_to_matrix_prefix: None,
             meshcore_to_matrix_prefix: None,
@@ -143,6 +150,10 @@ impl Default for RelayConfig {
 impl RelayConfig {
     pub fn dedupe_window(&self) -> Duration {
         Duration::from_secs(self.dedupe_window_secs)
+    }
+
+    pub fn reply_window(&self) -> Duration {
+        Duration::from_secs(self.reply_window_secs)
     }
 
     /// Template for a mesh message going to Matrix.
@@ -211,6 +222,13 @@ impl RelayConfig {
 
 fn default_dedupe_window_secs() -> u64 {
     30
+}
+
+/// Twelve hours. Long enough that answering something said this morning still
+/// threads, short enough that the table is a few hundred entries on any real
+/// mesh.
+fn default_reply_window_secs() -> u64 {
+    12 * 60 * 60
 }
 
 fn default_mesh_to_matrix_prefix() -> String {

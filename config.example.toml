@@ -17,6 +17,10 @@ access_token_file = "~/.config/loratrix/token"
 # How long a relayed message is remembered, to drop duplicates and the relay's
 # own echo coming back off another mesh.
 #dedupe_window_secs = 30
+# How long the relay remembers which mesh message a Matrix event is, so that a
+# reply written in Matrix goes out as a reply rather than as a loose remark.
+# Answering something older than this still works; it just arrives unthreaded.
+#reply_window_secs = 43200
 # Prefix templates. Placeholders:
 #
 #   {name}         best name there is, and the only one never left blank:

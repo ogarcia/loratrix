@@ -23,8 +23,9 @@ use tracing::{debug, info, warn};
 use crate::config::{Config, RelayConfig, Route};
 use crate::dedupe::{Dedupe, message_key};
 use crate::matrix::{MatrixMessage, MatrixSink, RoomId};
-use crate::mesh::{IncomingMesh, MeshBackend, MeshKind, NetworkId, Origin, Sender};
+use crate::mesh::{IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin, Sender};
 use crate::prefix::{self, Vars};
+use crate::replies::Replies;
 
 /// The name placeholders a template can ask for, worked out once from whatever
 /// the protocol actually carried.
@@ -86,6 +87,9 @@ pub struct Router {
     /// Rooms that only mirror DMs and therefore never send to a mesh.
     read_only: HashSet<RoomId>,
     dedupe: Mutex<Dedupe>,
+    /// Which mesh message each relayed Matrix event is, so that a reply can be
+    /// relayed as one.
+    replies: Mutex<Replies>,
 }
 
 impl Router {
@@ -142,6 +146,7 @@ impl Router {
             dm_inboxes,
             read_only,
             dedupe: Mutex::new(Dedupe::new(config.relay.dedupe_window())),
+            replies: Mutex::new(Replies::new(config.relay.reply_window())),
         };
         router.log_prefixes();
         Ok(router)
@@ -270,23 +275,50 @@ impl Router {
             message.text
         );
 
-        match self.matrix.send_text(room, &body).await {
-            Ok(()) => info!(
-                network = %message.network,
-                channel,
-                room = %room,
-                sender = %names.name,
-                text = %message.text,
-                "mesh -> matrix"
-            ),
-            Err(error) => warn!(room = %room, %error, "failed to relay a mesh message to Matrix"),
-        }
+        let event = match self.matrix.send_text(room, &body).await {
+            Ok(event) => {
+                info!(
+                    network = %message.network,
+                    channel,
+                    room = %room,
+                    sender = %names.name,
+                    text = %message.text,
+                    "mesh -> matrix"
+                );
+                // Now the two names for this one message are both known, so an
+                // answer written in Matrix can point back at what the mesh calls
+                // it.
+                if let Some(reference) = message.reference.clone() {
+                    self.replies
+                        .lock()
+                        .await
+                        .remember(&event, &message.network, reference, now);
+                }
+                Some(event)
+            }
+            Err(error) => {
+                warn!(room = %room, %error, "failed to relay a mesh message to Matrix");
+                None
+            }
+        };
 
-        self.fan_out(message, room, &names, now).await;
+        self.fan_out(message, room, &names, event.as_deref(), now)
+            .await;
     }
 
     /// Forward a mesh message to the other meshes sharing its room.
-    async fn fan_out(&self, message: &IncomingMesh, room: &str, names: &Names, now: Instant) {
+    ///
+    /// `event` is what Matrix called this message, where it got that far: the
+    /// copy on each other mesh is the same message, and a reply to the Matrix
+    /// event has to be able to find whichever copy shares its network.
+    async fn fan_out(
+        &self,
+        message: &IncomingMesh,
+        room: &str,
+        names: &Names,
+        event: Option<&str>,
+        now: Instant,
+    ) {
         let Some(routes) = self.outbound.get(room) else {
             return;
         };
@@ -316,14 +348,22 @@ impl Router {
                 now,
             );
 
-            match backend.send_channel(route.channel, &payload).await {
-                Ok(()) => info!(
-                    from = %message.network,
-                    network = %route.network,
-                    channel = route.channel,
-                    text = %payload,
-                    "mesh -> mesh"
-                ),
+            match backend.send_channel(route.channel, &payload, None).await {
+                Ok(sent) => {
+                    info!(
+                        from = %message.network,
+                        network = %route.network,
+                        channel = route.channel,
+                        text = %payload,
+                        "mesh -> mesh"
+                    );
+                    if let (Some(event), Some(id)) = (event, sent) {
+                        self.replies
+                            .lock()
+                            .await
+                            .remember(event, &route.network, id, now);
+                    }
+                }
                 Err(error) => warn!(
                     network = %route.network,
                     channel = route.channel,
@@ -371,7 +411,7 @@ impl Router {
                 // Who and where, but not what. A direct message was addressed
                 // to this node and to nobody else, and a log is a place text
                 // outlives the room it was meant for.
-                Ok(()) => info!(
+                Ok(_) => info!(
                     network = %message.network,
                     room = %target.room,
                     sender = %names.name,
@@ -408,13 +448,44 @@ impl Router {
                 continue;
             };
 
+            // What the answered event is called on *this* mesh. A reply to
+            // something we no longer remember, or that never reached this mesh,
+            // goes out as an ordinary message: the answer still arrives, it just
+            // arrives without its thread.
+            let reply_to = match &message.reply_to {
+                Some(event) => self
+                    .replies
+                    .lock()
+                    .await
+                    .message_for(event, &route.network, now),
+                None => None,
+            };
+            if message.reply_to.is_some() && reply_to.is_none() {
+                debug!(
+                    room = %message.room_id,
+                    network = %route.network,
+                    "a reply to something this mesh does not know, sending it plainly"
+                );
+            }
+
+            // Where the protocol writes the relation into the text, it is written
+            // here rather than in the backend: the marker spends payload, and the
+            // budget is applied a couple of lines below. Where it does, the
+            // backend is then told nothing — the relation has already been said,
+            // and saying it twice is how a message ends up with two of them.
+            let marker = reply_to.as_ref().and_then(|to| backend.reply_marker(to));
+            let body = match &marker {
+                Some(marker) => format!("{marker}{}", message.body),
+                None => message.body.clone(),
+            };
+            let in_packet = marker.is_none().then(|| reply_to.clone()).flatten();
             let template = self.relay.matrix_to_mesh(Some(backend.kind()));
             let payload = prefix::fit(
                 &prefix::render(
                     template,
                     &names.vars(&route.network, "", Some(route.channel)),
                 ),
-                &message.body,
+                &body,
                 backend.max_payload(),
             );
 
@@ -423,17 +494,33 @@ impl Router {
                 now,
             );
 
-            match backend.send_channel(route.channel, &payload).await {
-                Ok(()) => info!(
-                    room = %message.room_id,
-                    network = %route.network,
-                    channel = route.channel,
-                    sender = %names.name,
-                    // The payload as it went out, prefix and truncation included,
-                    // which is what a mesh client will have seen.
-                    text = %payload,
-                    "matrix -> mesh"
-                ),
+            match backend
+                .send_channel(route.channel, &payload, in_packet)
+                .await
+            {
+                Ok(sent) => {
+                    info!(
+                        room = %message.room_id,
+                        network = %route.network,
+                        channel = route.channel,
+                        sender = %names.name,
+                        // The payload as it went out, prefix and truncation included,
+                        // which is what a mesh client will have seen.
+                        text = %payload,
+                        reply_to = reply_to.as_ref().map(MessageRef::to_string),
+                        "matrix -> mesh"
+                    );
+                    // And this message becomes something that can be replied to
+                    // in turn.
+                    if let Some(reference) = sent {
+                        self.replies.lock().await.remember(
+                            &message.event_id,
+                            &route.network,
+                            reference,
+                            now,
+                        );
+                    }
+                }
                 Err(error) => warn!(
                     network = %route.network,
                     channel = route.channel,
@@ -517,11 +604,16 @@ mod tests {
     use crate::mesh::{MeshKind, PeerId, Sender};
 
     /// Records what it was asked to transmit instead of touching a radio.
+    ///
+    /// It answers about threading the way the protocol it is standing in for
+    /// does, because that is the part under test: a Meshtastic fake hands back
+    /// packet ids counting from one, a MeshCore one reads the name back out of
+    /// the text exactly as the real backend does.
     struct FakeBackend {
         id: String,
         kind: MeshKind,
         max_payload: usize,
-        sent: Mutex<Vec<(u8, String)>>,
+        sent: Mutex<Vec<(u8, String, Option<MessageRef>)>>,
     }
 
     impl FakeBackend {
@@ -534,8 +626,25 @@ mod tests {
             })
         }
 
+        /// What went out, without the threading, which most tests do not care
+        /// about.
         async fn sent(&self) -> Vec<(u8, String)> {
-            self.sent.lock().await.clone()
+            self.sent
+                .lock()
+                .await
+                .iter()
+                .map(|(channel, text, _)| (*channel, text.clone()))
+                .collect()
+        }
+
+        /// What each of those was a reply to.
+        async fn replied_to(&self) -> Vec<Option<MessageRef>> {
+            self.sent
+                .lock()
+                .await
+                .iter()
+                .map(|(_, _, reply_to)| reply_to.clone())
+                .collect()
         }
     }
 
@@ -561,9 +670,31 @@ mod tests {
             Ok(())
         }
 
-        async fn send_channel(&self, channel: u8, text: &str) -> Result<()> {
-            self.sent.lock().await.push((channel, text.to_owned()));
-            Ok(())
+        fn reply_marker(&self, to: &MessageRef) -> Option<String> {
+            match (self.kind, to) {
+                (MeshKind::MeshCore, MessageRef::Author(name)) => Some(format!("@[{name}] ")),
+                _ => None,
+            }
+        }
+
+        async fn send_channel(
+            &self,
+            channel: u8,
+            text: &str,
+            reply_to: Option<MessageRef>,
+        ) -> Result<Option<MessageRef>> {
+            let mut sent = self.sent.lock().await;
+            sent.push((channel, text.to_owned(), reply_to));
+            Ok(match self.kind {
+                MeshKind::Meshtastic => Some(MessageRef::Packet(
+                    u32::try_from(sent.len()).expect("few sends in a test"),
+                )),
+                // The name is whatever the prefix template wrote in, which is
+                // what a MeshCore client would show and therefore answer.
+                MeshKind::MeshCore => text
+                    .split_once(": ")
+                    .map(|(name, _)| MessageRef::Author(name.to_owned())),
+            })
         }
 
         async fn send_direct(&self, _peer: &PeerId, _text: &str) -> Result<()> {
@@ -589,6 +720,12 @@ mod tests {
         async fn sent(&self) -> Vec<(String, String)> {
             self.sent.lock().await.clone()
         }
+
+        /// The id this fake would have given the nth message it posted, counting
+        /// from one, so a test can reply to something it made the relay say.
+        fn event_id(nth: usize) -> String {
+            format!("$event{nth}")
+        }
     }
 
     #[async_trait]
@@ -605,12 +742,10 @@ mod tests {
             Ok(())
         }
 
-        async fn send_text(&self, room_id: &str, body: &str) -> Result<()> {
-            self.sent
-                .lock()
-                .await
-                .push((room_id.to_owned(), body.to_owned()));
-            Ok(())
+        async fn send_text(&self, room_id: &str, body: &str) -> Result<String> {
+            let mut sent = self.sent.lock().await;
+            sent.push((room_id.to_owned(), body.to_owned()));
+            Ok(Self::event_id(sent.len()))
         }
     }
 
@@ -646,6 +781,12 @@ mod tests {
         routes = [{ network = "lora", channel = 0 }]
     "#;
 
+    const MESHCORE_ROOM: &str = r#"
+        [[rooms]]
+        id = "!room:example.org"
+        routes = [{ network = "mc", channel = 0 }]
+    "#;
+
     const BRIDGED_ROOM: &str = r#"
         [[rooms]]
         id = "!room:example.org"
@@ -676,6 +817,12 @@ mod tests {
         }
     }
 
+    /// The packet id every `from_mesh` message carries, which is what a reply to
+    /// it has to name.
+    fn mesh_packet() -> MessageRef {
+        MessageRef::Packet(0xbeef)
+    }
+
     fn from_mesh(network: &str, channel: u8, name: Option<&str>, text: &str) -> IncomingMesh {
         IncomingMesh {
             network: network.to_owned(),
@@ -686,6 +833,34 @@ mod tests {
                 short_name: None,
             }),
             text: text.to_owned(),
+            reference: Some(mesh_packet()),
+        }
+    }
+
+    /// A MeshCore channel message, which points at its author rather than at a
+    /// packet, because that is all its protocol says about itself.
+    fn from_meshcore(network: &str, channel: u8, name: &str, text: &str) -> IncomingMesh {
+        IncomingMesh {
+            reference: Some(MessageRef::Author(name.to_owned())),
+            ..from_mesh(network, channel, Some(name), text)
+        }
+    }
+
+    fn from_matrix(room: &str, sender: &str, body: &str) -> MatrixMessage {
+        MatrixMessage {
+            room_id: room.to_owned(),
+            sender: sender.to_owned(),
+            body: body.to_owned(),
+            event_id: "$typed:example.org".to_owned(),
+            reply_to: None,
+        }
+    }
+
+    /// The same, but answering a Matrix event.
+    fn replying_to(event: &str, room: &str, sender: &str, body: &str) -> MatrixMessage {
+        MatrixMessage {
+            reply_to: Some(event.to_owned()),
+            ..from_matrix(room, sender, body)
         }
     }
 
@@ -710,11 +885,7 @@ mod tests {
         let h = harness(ONE_ROOM);
         h.router
             .handle_matrix(
-                MatrixMessage {
-                    room_id: "!room:example.org".to_owned(),
-                    sender: "@bob:example.org".to_owned(),
-                    body: "hola".to_owned(),
-                },
+                from_matrix("!room:example.org", "@bob:example.org", "hola"),
                 Instant::now(),
             )
             .await;
@@ -727,11 +898,11 @@ mod tests {
         let h = harness(ONE_ROOM);
         h.router
             .handle_matrix(
-                MatrixMessage {
-                    room_id: "!room:example.org".to_owned(),
-                    sender: "@relay:example.org".to_owned(),
-                    body: "[Alice/lora]: hola".to_owned(),
-                },
+                from_matrix(
+                    "!room:example.org",
+                    "@relay:example.org",
+                    "[Alice/lora]: hola",
+                ),
                 Instant::now(),
             )
             .await;
@@ -795,6 +966,7 @@ mod tests {
                         short_name: Some("ALCO".to_owned()),
                     }),
                     text: "hola".to_owned(),
+                    reference: Some(mesh_packet()),
                 },
                 Instant::now(),
             )
@@ -812,6 +984,7 @@ mod tests {
                         short_name: None,
                     }),
                     text: "bos dias".to_owned(),
+                    reference: Some(MessageRef::Author("EA1HYZ".to_owned())),
                 },
                 Instant::now(),
             )
@@ -846,11 +1019,7 @@ mod tests {
 
         router
             .handle_matrix(
-                MatrixMessage {
-                    room_id: "!room:example.org".to_owned(),
-                    sender: "@roberto:example.org".to_owned(),
-                    body: "hola".to_owned(),
-                },
+                from_matrix("!room:example.org", "@roberto:example.org", "hola"),
                 Instant::now(),
             )
             .await;
@@ -960,17 +1129,208 @@ mod tests {
         );
     }
 
+    /// The whole point, in the direction the user tried: answer in Matrix
+    /// something a Meshtastic node said, and it goes back as a reply to that
+    /// packet rather than as a remark nobody can place.
+    #[tokio::test]
+    async fn a_matrix_reply_answers_the_packet_it_replies_to() {
+        let h = harness(ONE_ROOM);
+        let now = Instant::now();
+        h.router
+            .handle_mesh(from_mesh("lora", 0, Some("Alice"), "hola"), now)
+            .await;
+
+        h.router
+            .handle_matrix(
+                replying_to(
+                    &FakeSink::event_id(1),
+                    "!room:example.org",
+                    "@bob:example.org",
+                    "buenas",
+                ),
+                now,
+            )
+            .await;
+
+        assert_eq!(h.lora.sent().await, [(0, "bob[M]: buenas".to_owned())]);
+        assert_eq!(
+            h.lora.replied_to().await,
+            [Some(mesh_packet())],
+            "the packet the mesh message arrived as is what the reply must name"
+        );
+    }
+
+    /// MeshCore has no field for it, so the relation is written into the text —
+    /// after the sender's name, which is where its clients put it.
+    #[tokio::test]
+    async fn a_matrix_reply_on_meshcore_is_written_into_the_text() {
+        let mut config = config(MESHCORE_ROOM);
+        config.relay.matrix_to_mesh_prefix = "{name}: ".to_owned();
+
+        let mc = FakeBackend::new("mc", MeshKind::MeshCore);
+        let sink = FakeSink::new();
+        let router = Router::build(&config, vec![mc.clone()], sink).expect("router builds");
+
+        let now = Instant::now();
+        router
+            .handle_mesh(from_meshcore("mc", 0, "ALICE", "Hola a todos"), now)
+            .await;
+        router
+            .handle_matrix(
+                replying_to(
+                    &FakeSink::event_id(1),
+                    "!room:example.org",
+                    "@bob:example.org",
+                    "Hola Alice",
+                ),
+                now,
+            )
+            .await;
+
+        assert_eq!(
+            mc.sent().await,
+            [(0, "bob: @[ALICE] Hola Alice".to_owned())],
+            "exactly what a MeshCore client writes when it answers somebody"
+        );
+        assert_eq!(
+            mc.replied_to().await,
+            [None],
+            "the backend is told nothing: the marker is already in the text"
+        );
+    }
+
+    /// The marker is part of the payload, so it has to be counted before the
+    /// text is cut — otherwise a reply loses exactly the room the marker takes.
+    #[tokio::test]
+    async fn a_meshcore_reply_marker_is_charged_against_the_payload() {
+        let mut config = config(MESHCORE_ROOM);
+        config.relay.matrix_to_mesh_prefix = "{name}: ".to_owned();
+
+        let mc = FakeBackend::new("mc", MeshKind::MeshCore);
+        let sink = FakeSink::new();
+        let router = Router::build(&config, vec![mc.clone()], sink).expect("router builds");
+
+        let now = Instant::now();
+        router
+            .handle_mesh(from_meshcore("mc", 0, "ALICE", "Hola a todos"), now)
+            .await;
+        router
+            .handle_matrix(
+                replying_to(
+                    &FakeSink::event_id(1),
+                    "!room:example.org",
+                    "@bob:example.org",
+                    &"x".repeat(500),
+                ),
+                now,
+            )
+            .await;
+
+        let sent = mc.sent().await;
+        assert_eq!(sent[0].1.len(), 200, "the budget is the budget");
+        assert!(sent[0].1.starts_with("bob: @[ALICE] x"));
+    }
+
+    /// A reply to something older than the window, or from before a restart, is
+    /// still delivered. It just arrives as an ordinary message.
+    #[tokio::test]
+    async fn a_reply_to_something_forgotten_still_gets_through() {
+        let h = harness(ONE_ROOM);
+        h.router
+            .handle_matrix(
+                replying_to(
+                    "$long-gone:example.org",
+                    "!room:example.org",
+                    "@bob:example.org",
+                    "buenas",
+                ),
+                Instant::now(),
+            )
+            .await;
+
+        assert_eq!(h.lora.sent().await, [(0, "bob[M]: buenas".to_owned())]);
+        assert_eq!(h.lora.replied_to().await, [None]);
+    }
+
+    /// Answering something that was itself typed in Matrix: the relay sent that
+    /// one, so it knows which packet it became.
+    #[tokio::test]
+    async fn a_reply_to_a_matrix_message_names_the_packet_the_relay_sent() {
+        let h = harness(ONE_ROOM);
+        let now = Instant::now();
+        h.router
+            .handle_matrix(
+                from_matrix("!room:example.org", "@alice:example.org", "hola"),
+                now,
+            )
+            .await;
+
+        h.router
+            .handle_matrix(
+                replying_to(
+                    "$typed:example.org",
+                    "!room:example.org",
+                    "@bob:example.org",
+                    "buenas",
+                ),
+                now,
+            )
+            .await;
+
+        assert_eq!(
+            h.lora.replied_to().await,
+            [None, Some(MessageRef::Packet(1))],
+            "the second must answer the packet the first went out as"
+        );
+    }
+
+    /// One Matrix event bridged to two meshes is two different packets, and each
+    /// reply has to name the one on its own mesh.
+    #[tokio::test]
+    async fn a_reply_in_a_bridged_room_names_the_right_message_on_each_mesh() {
+        let h = harness(BRIDGED_ROOM);
+        let now = Instant::now();
+        // Said on lora, mirrored to Matrix, and fanned out to mc.
+        h.router
+            .handle_mesh(from_mesh("lora", 0, Some("Alice"), "hola"), now)
+            .await;
+
+        h.router
+            .handle_matrix(
+                replying_to(
+                    &FakeSink::event_id(1),
+                    "!room:example.org",
+                    "@bob:example.org",
+                    "buenas",
+                ),
+                now,
+            )
+            .await;
+
+        assert_eq!(
+            h.lora.replied_to().await,
+            [Some(mesh_packet())],
+            "on lora, the packet it originally arrived as"
+        );
+        assert_eq!(
+            h.mc.replied_to().await,
+            [None, None],
+            "on mc the relation is in the text, so neither send tells the backend"
+        );
+        assert_eq!(
+            h.mc.sent().await[1].1,
+            "bob[M]: @[Alice[lora]] buenas".to_owned(),
+            "and it points at the name the fanned-out copy went out under"
+        );
+    }
+
     #[tokio::test]
     async fn a_matrix_message_to_a_bridged_room_reaches_every_mesh_once() {
         let h = harness(BRIDGED_ROOM);
         let now = Instant::now();
         h.router
             .handle_matrix(
-                MatrixMessage {
-                    room_id: "!room:example.org".to_owned(),
-                    sender: "@bob:example.org".to_owned(),
-                    body: "hola".to_owned(),
-                },
+                from_matrix("!room:example.org", "@bob:example.org", "hola"),
                 now,
             )
             .await;
@@ -1012,6 +1372,7 @@ mod tests {
                 short_name: None,
             }),
             text: text.to_owned(),
+            reference: None,
         }
     }
 
@@ -1062,11 +1423,7 @@ mod tests {
         let h = harness(DM_ROOMS);
         h.router
             .handle_matrix(
-                MatrixMessage {
-                    room_id: "!dm:example.org".to_owned(),
-                    sender: "@bob:example.org".to_owned(),
-                    body: "can you hear me?".to_owned(),
-                },
+                from_matrix("!dm:example.org", "@bob:example.org", "can you hear me?"),
                 Instant::now(),
             )
             .await;
@@ -1091,11 +1448,7 @@ mod tests {
         let body = "x".repeat(500);
         h.router
             .handle_matrix(
-                MatrixMessage {
-                    room_id: "!room:example.org".to_owned(),
-                    sender: "@bob:example.org".to_owned(),
-                    body,
-                },
+                from_matrix("!room:example.org", "@bob:example.org", &body),
                 Instant::now(),
             )
             .await;

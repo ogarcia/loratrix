@@ -76,6 +76,43 @@ impl fmt::Display for PeerId {
     }
 }
 
+/// How a reply names the message it answers, which the two protocols do
+/// differently — the same split as sender identity, and for the same reason.
+///
+/// Meshtastic has a field for it: every packet carries a 32-bit id and a reply
+/// quotes it. MeshCore has nothing of the kind on the wire, so its clients do
+/// what they already do for the sender's name and put it in the text, writing
+/// `@[NAME]` at the head of the answer:
+///
+/// ```text
+/// ALICE: Hola a todos
+/// BOB: @[ALICE] Hola Alice
+/// ```
+///
+/// Which means what MeshCore points at is the person rather than the message. It
+/// is what the protocol gives us, and it is what every client there understands.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[allow(
+    dead_code,
+    reason = "each variant belongs to one backend, and a build may not have it"
+)]
+pub enum MessageRef {
+    /// A Meshtastic packet id.
+    Packet(u32),
+    /// The name a MeshCore client wrote into the text, which is all a reply
+    /// there has to point at.
+    Author(String),
+}
+
+impl fmt::Display for MessageRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MessageRef::Packet(id) => write!(f, "{id:08x}"),
+            MessageRef::Author(name) => f.write_str(name),
+        }
+    }
+}
+
 /// Where a received message came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(
@@ -120,6 +157,10 @@ pub struct IncomingMesh {
     /// case for every MeshCore channel message.
     pub sender: Option<Sender>,
     pub text: String,
+    /// What a reply to this message would have to name. `None` when there is
+    /// nothing to name it by, which on MeshCore is any message whose sender we
+    /// could not recover from the text.
+    pub reference: Option<MessageRef>,
 }
 
 impl IncomingMesh {
@@ -154,8 +195,34 @@ pub trait MeshBackend: Send + Sync {
     /// Connect and pump received messages into `tx` until cancelled.
     async fn run(&self, tx: mpsc::Sender<IncomingMesh>) -> Result<()>;
 
-    /// Broadcast on a channel.
-    async fn send_channel(&self, channel: u8, text: &str) -> Result<()>;
+    /// How this protocol writes "in reply to" *inside the text*, where it writes
+    /// it there at all.
+    ///
+    /// MeshCore does, because it has nowhere else to put it. The marker is
+    /// therefore part of the payload and has to be applied by the router, before
+    /// the text is measured against [`max_payload`] — otherwise a reply is
+    /// truncated by exactly the room the marker takes.
+    ///
+    /// Meshtastic answers [`None`]: its reply travels in a field of the packet,
+    /// which is what `reply_to` is for and costs the text nothing.
+    ///
+    /// [`max_payload`]: MeshBackend::max_payload
+    fn reply_marker(&self, _to: &MessageRef) -> Option<String> {
+        None
+    }
+
+    /// Broadcast on a channel, optionally as a reply to a message already there.
+    ///
+    /// Returns what a reply to *this* message would have to name, so the router
+    /// can tie it to the Matrix event it came from. A backend asked for a reply
+    /// it cannot express sends the text plainly rather than failing: a message
+    /// delivered without its thread beats no message at all.
+    async fn send_channel(
+        &self,
+        channel: u8,
+        text: &str,
+        reply_to: Option<MessageRef>,
+    ) -> Result<Option<MessageRef>>;
 
     /// Send a direct message to a peer.
     ///
@@ -206,6 +273,7 @@ mod tests {
             origin: Origin::Direct(PeerId::Node(7)),
             sender: None,
             text: "hi".to_owned(),
+            reference: None,
         };
         assert_eq!(direct.channel(), None);
 

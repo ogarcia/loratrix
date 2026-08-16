@@ -28,7 +28,9 @@ use tokio::time::{Instant, sleep, sleep_until};
 use tracing::{debug, info, trace, warn};
 
 use crate::config::{NetworkConfig, NetworkKind, Transport};
-use crate::mesh::{IncomingMesh, MeshBackend, MeshKind, NetworkId, Origin, PeerId, Sender};
+use crate::mesh::{
+    IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin, PeerId, Sender,
+};
 
 /// Every node, rather than one of them. Meshtastic has no constant for it.
 const BROADCAST_ADDR: u32 = 0xffff_ffff;
@@ -341,6 +343,9 @@ impl MeshtasticBackend {
             origin,
             sender: Some(self.sender_of(packet.from)),
             text,
+            // What a reply to this would have to name. Zero is the firmware's
+            // "unset", and a packet without an id is one nothing can point at.
+            reference: (packet.id != 0).then_some(MessageRef::Packet(packet.id)),
         })
     }
 
@@ -414,13 +419,28 @@ impl MeshtasticBackend {
     /// Built by hand rather than through the crate's `send_text`, which offers no
     /// way to set a hop limit and leaves the field at zero. See [`DEFAULT_HOP_LIMIT`]
     /// for why that alone is enough to make a relay look like it is working while
-    /// nothing it says travels past the nodes in earshot.
-    fn outgoing(&self, to: u32, channel: MeshChannel, text: &str) -> protobufs::MeshPacket {
+    /// nothing it says travels past the nodes in earshot. Naming a message to
+    /// reply to is the other thing `send_text` cannot express.
+    fn outgoing(
+        &self,
+        to: u32,
+        channel: MeshChannel,
+        text: &str,
+        reply_to: Option<&MessageRef>,
+    ) -> protobufs::MeshPacket {
         protobufs::MeshPacket {
             payload_variant: Some(protobufs::mesh_packet::PayloadVariant::Decoded(
                 protobufs::Data {
                     portnum: protobufs::PortNum::TextMessageApp as i32,
                     payload: text.as_bytes().to_vec(),
+                    // Zero is what an ordinary message carries, so an unanswered
+                    // one needs no special case.
+                    reply_id: match reply_to {
+                        Some(MessageRef::Packet(id)) => *id,
+                        // Nothing else names a Meshtastic packet, and zero
+                        // is what an ordinary message carries.
+                        _ => 0,
+                    },
                     ..Default::default()
                 },
             )),
@@ -443,8 +463,15 @@ impl MeshtasticBackend {
         }
     }
 
-    /// Hand text to the radio, addressed as told.
-    async fn transmit(&self, to: u32, channel: u8, text: &str) -> Result<()> {
+    /// Hand text to the radio, addressed as told, and report the id it went out
+    /// under so that an answer to it can be recognized later.
+    async fn transmit(
+        &self,
+        to: u32,
+        channel: u8,
+        text: &str,
+        reply_to: Option<MessageRef>,
+    ) -> Result<MessageRef> {
         let channel = MeshChannel::new(u32::from(channel)).map_err(|error| {
             anyhow::anyhow!("channel {channel} is not one a radio has: {error}")
         })?;
@@ -457,7 +484,8 @@ impl MeshtasticBackend {
             None => bail!("network {:?} is not connected", self.id),
         };
 
-        let packet = self.outgoing(to, channel, text);
+        let packet = self.outgoing(to, channel, text, reply_to.as_ref());
+        let id = MessageRef::Packet(packet.id);
         // Logged before sending, and with the packet id, because that is what the
         // radio's queue report comes back naming.
         debug!(
@@ -465,11 +493,13 @@ impl MeshtasticBackend {
             packet = packet.id,
             channel = packet.channel,
             hops = packet.hop_limit,
+            reply_to = reply_to.as_ref().map(MessageRef::to_string),
             "handing a packet to the radio"
         );
         api.send_to_radio_packet(Some(protobufs::to_radio::PayloadVariant::Packet(packet)))
             .await
-            .with_context(|| format!("sending on {}", self.id))
+            .with_context(|| format!("sending on {}", self.id))?;
+        Ok(id)
     }
 }
 
@@ -515,8 +545,15 @@ impl MeshBackend for MeshtasticBackend {
         }
     }
 
-    async fn send_channel(&self, channel: u8, text: &str) -> Result<()> {
-        self.transmit(BROADCAST_ADDR, channel, text).await
+    async fn send_channel(
+        &self,
+        channel: u8,
+        text: &str,
+        reply_to: Option<MessageRef>,
+    ) -> Result<Option<MessageRef>> {
+        self.transmit(BROADCAST_ADDR, channel, text, reply_to)
+            .await
+            .map(Some)
     }
 
     async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<()> {
@@ -525,7 +562,7 @@ impl MeshBackend for MeshtasticBackend {
         };
         // The primary channel, which is where a direct message goes: the address
         // is what makes it private, not the channel.
-        self.transmit(*num, 0, text).await
+        self.transmit(*num, 0, text, None).await.map(|_| ())
     }
 
     fn resolve_name(&self, peer: &PeerId) -> Option<String> {
@@ -803,6 +840,7 @@ mod tests {
             BROADCAST_ADDR,
             MeshChannel::new(0).expect("channel nought"),
             "bos dias",
+            None,
         );
         assert_ne!(
             packet.hop_limit, 0,
@@ -820,6 +858,7 @@ mod tests {
             BROADCAST_ADDR,
             MeshChannel::new(0).expect("channel nought"),
             "bos dias",
+            None,
         );
         assert_eq!(packet.hop_limit, 5);
     }
@@ -849,7 +888,7 @@ mod tests {
         let backend = offline_backend();
         backend.my_node_num.store(42, Ordering::Relaxed);
 
-        let packet = backend.outgoing(9, MeshChannel::new(3).expect("channel three"), "hola");
+        let packet = backend.outgoing(9, MeshChannel::new(3).expect("channel three"), "hola", None);
 
         assert_eq!(packet.from, 42);
         assert_eq!(packet.to, 9);
@@ -872,7 +911,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_to_send_while_disconnected() {
         let error = offline_backend()
-            .send_channel(0, "hola")
+            .send_channel(0, "hola", None)
             .await
             .expect_err("sending without a link must fail");
         assert!(error.to_string().contains("not connected"), "{error}");
@@ -882,7 +921,7 @@ mod tests {
     async fn refuses_a_channel_no_radio_has() {
         // Meshtastic has eight, numbered nought to seven.
         let error = offline_backend()
-            .send_channel(9, "hola")
+            .send_channel(9, "hola", None)
             .await
             .expect_err("channel nine must be refused");
         assert!(error.to_string().contains("not one a radio has"), "{error}");
