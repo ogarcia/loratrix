@@ -31,7 +31,6 @@ arriving back and being parsed, and 80 real Matrix events read.
 - Duplicate and echo suppression, so bridged meshes do not loop.
 - Replies: answering a message in Matrix reaches the mesh as a reply to that
   message, in whichever way the protocol there expresses one.
-
 - Reactions from Meshtastic reach Matrix, as a reaction where that says the
   truth and as an emote where it would not.
 
