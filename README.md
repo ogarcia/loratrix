@@ -119,7 +119,11 @@ Logging follows `RUST_LOG`, for example `RUST_LOG=loratrix=debug`.
 Worth knowing, because it shows up in the output:
 
 - **Meshtastic** packets carry the sender's node number, resolved to a name
-  against the radio's node database.
+  against the radio's node database. That database only covers nodes the radio
+  already knew when the relay connected, so a node that turns up afterwards is
+  learnt from the `NODEINFO_APP` packet it announces itself with. Until one
+  arrives it is named by its address, `!adb2c99a`, which is worse than a name and
+  much better than nothing.
 - **MeshCore** channel messages carry no sender identity at all. Every client
   makes up for that by writing the name into the text, as `NAME: MESSAGE`, so
   that is where the relay recovers it from — the first `": "` is the one the

@@ -823,8 +823,17 @@ impl Router {
     /// Pick apart what a sender gave us into the three name placeholders.
     fn names_of(&self, sender: Option<&Sender>) -> Names {
         Names {
+            // An address is worse than a name and far better than nothing: it says
+            // which node said this, and it can be looked up. The configured
+            // stand-in is for where even that is missing, which is every MeshCore
+            // channel message.
             name: sender
                 .and_then(|sender| sender.display_name().map(str::to_owned))
+                .or_else(|| {
+                    sender
+                        .and_then(|sender| sender.id.as_ref())
+                        .map(ToString::to_string)
+                })
                 .unwrap_or_else(|| self.relay.unknown_sender_name.clone()),
             long: sender
                 .and_then(|sender| sender.long_name.clone())
@@ -1415,6 +1424,38 @@ mod tests {
             mc.sent().await,
             [(0, "roberto: hola".to_owned())],
             "MeshCore clients expect a name and a colon, so its template can say so"
+        );
+    }
+
+    /// A Meshtastic node whose name we do not know yet still says which node it
+    /// is. Reporting it as `unknown` threw away something we had.
+    #[tokio::test]
+    async fn an_unnamed_meshtastic_node_is_identified_by_its_address() {
+        let h = harness(ONE_ROOM);
+        h.router
+            .handle_mesh(
+                IncomingMesh {
+                    network: "lora".to_owned(),
+                    origin: Origin::Channel(0),
+                    sender: Some(Sender {
+                        id: Some(PeerId::Node(0xadb2_c99a)),
+                        long_name: None,
+                        short_name: None,
+                    }),
+                    text: "Hi".to_owned(),
+                    reference: Some(mesh_packet()),
+                    reacts_to: None,
+                },
+                Instant::now(),
+            )
+            .await;
+
+        assert_eq!(
+            h.sink.sent().await,
+            [(
+                "!room:example.org".to_owned(),
+                "[!adb2c99a/lora]: Hi".to_owned()
+            )]
         );
     }
 

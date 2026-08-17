@@ -328,6 +328,20 @@ impl MeshtasticBackend {
             return None;
         }
 
+        // A node saying who it is. The database the radio hands over while the
+        // session is being configured only covers nodes it already knew, so
+        // without this a node that turns up afterwards — or renames itself — stays
+        // nameless until the next reconnect.
+        if data.portnum == protobufs::PortNum::NodeinfoApp as i32 {
+            match protobufs::User::decode(&data.payload[..]) {
+                Ok(user) => self.remember_user(packet.from, &user),
+                Err(error) => {
+                    debug!(network = %self.id, %error, "a node info we could not read");
+                }
+            }
+            return None;
+        }
+
         if data.portnum != protobufs::PortNum::TextMessageApp as i32 {
             trace!(network = %self.id, portnum = data.portnum, "not a text message");
             return None;
@@ -440,17 +454,29 @@ impl MeshtasticBackend {
     }
 
     fn remember_name(&self, node: &protobufs::NodeInfo) {
-        let Some(user) = node.user.as_ref() else {
-            return;
-        };
+        if let Some(user) = node.user.as_ref() {
+            self.remember_user(node.num, user);
+        }
+    }
+
+    /// What a node calls itself, from wherever we heard it: the database the radio
+    /// hands over on connecting, or the node announcing itself later.
+    fn remember_user(&self, num: u32, user: &protobufs::User) {
         let sender = Sender {
-            id: Some(PeerId::Node(node.num)),
+            id: Some(PeerId::Node(num)),
             long_name: Some(user.long_name.clone()),
             short_name: Some(user.short_name.clone()),
         };
         match self.names.write() {
             Ok(mut names) => {
-                names.insert(node.num, sender);
+                if names.insert(num, sender).is_none() {
+                    debug!(
+                        network = %self.id,
+                        node = %PeerId::Node(num),
+                        name = %user.long_name,
+                        "a node we had not heard of"
+                    );
+                }
             }
             Err(_) => warn!(network = %self.id, "the name cache lock is poisoned"),
         }
@@ -941,6 +967,47 @@ mod tests {
         let sender = message.sender.expect("the number is always there");
         assert_eq!(sender.id, Some(PeerId::Node(0x1a2b_3c4d)));
         assert_eq!(sender.display_name(), None);
+    }
+
+    /// The bug this was written for: the node database arrives while the session
+    /// is being configured and covers only what the radio already knew. A node
+    /// that turns up afterwards announces itself with one of these, and until it
+    /// was read such a node reached Matrix with no name at all.
+    ///
+    /// The names are the ones a real node on the Galicia mesh advertises, emoji
+    /// and all, because that is what proves the payload is decoded rather than
+    /// merely accepted.
+    #[test]
+    fn a_node_announcing_itself_later_is_learnt() {
+        let backend = offline_backend();
+        let num = 0xadb2_c99a;
+        let user = protobufs::User {
+            id: "!adb2c99a".to_owned(),
+            long_name: "🚖 EA1CUE TRABAJO TRIVES🏔️".to_owned(),
+            short_name: "061".to_owned(),
+            ..Default::default()
+        };
+
+        let mut packet = text_packet(num, BROADCAST_ADDR, 0, "");
+        if let Some(protobufs::mesh_packet::PayloadVariant::Decoded(data)) =
+            packet.payload_variant.as_mut()
+        {
+            data.portnum = protobufs::PortNum::NodeinfoApp as i32;
+            data.payload = user.encode_to_vec();
+        }
+
+        assert!(
+            backend.message(packet).is_none(),
+            "a node introducing itself is not a message to relay"
+        );
+
+        let learnt = backend.sender_of(num);
+        assert_eq!(
+            learnt.display_name(),
+            Some("🚖 EA1CUE TRABAJO TRIVES🏔️"),
+            "and the next message from it must carry a name"
+        );
+        assert_eq!(learnt.short_name.as_deref(), Some("061"));
     }
 
     #[test]
