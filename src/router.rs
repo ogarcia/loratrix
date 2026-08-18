@@ -1427,6 +1427,48 @@ mod tests {
         );
     }
 
+    /// The complaint this was written for: with `[{short}/{long}]` configured, a
+    /// node the relay had no name for rendered as `[/]: Hi`. The backend now
+    /// hands over the address in both, so the template has something to put.
+    #[tokio::test]
+    async fn a_template_asking_for_both_names_renders_for_a_nameless_node() {
+        let mut config = config(ONE_ROOM);
+        config.relay.meshtastic_to_matrix_prefix = Some("[{short}/{long}]: ".to_owned());
+
+        let lora = FakeBackend::new("lora", MeshKind::Meshtastic);
+        let sink = FakeSink::new();
+        let router = Router::build(&config, vec![lora], sink.clone()).expect("router builds");
+
+        router
+            .handle_mesh(
+                IncomingMesh {
+                    network: "lora".to_owned(),
+                    origin: Origin::Channel(0),
+                    // What the Meshtastic backend reports for a node that has not
+                    // said who it is.
+                    sender: Some(Sender {
+                        id: Some(PeerId::Node(0xadb2_c99a)),
+                        long_name: Some("!adb2c99a".to_owned()),
+                        short_name: Some("c99a".to_owned()),
+                    }),
+                    text: "Hi".to_owned(),
+                    reference: Some(mesh_packet()),
+                    reacts_to: None,
+                },
+                Instant::now(),
+            )
+            .await;
+
+        assert_eq!(
+            sink.sent().await,
+            [(
+                "!room:example.org".to_owned(),
+                "[c99a/!adb2c99a]: Hi".to_owned()
+            )],
+            "and never [/]"
+        );
+    }
+
     /// A Meshtastic node whose name we do not know yet still says which node it
     /// is. Reporting it as `unknown` threw away something we had.
     #[tokio::test]

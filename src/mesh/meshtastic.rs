@@ -69,6 +69,12 @@ const MIN_SEND_INTERVAL: Duration = Duration::from_secs(2);
 const RECONNECT_DELAY_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(60);
 
+/// A name we were given and that says something, or nothing at all. Radios that
+/// were never configured report empty strings rather than omitting the field.
+fn filled(name: Option<String>) -> Option<String> {
+    name.filter(|name| !name.is_empty())
+}
+
 /// Where the radio is and how to reach it.
 #[derive(Clone, Debug)]
 enum Link {
@@ -442,15 +448,40 @@ impl MeshtasticBackend {
 
     /// What we know about a node, which may be no more than its number.
     fn sender_of(&self, num: u32) -> Sender {
-        self.names
+        let known = self
+            .names
             .read()
             .ok()
-            .and_then(|names| names.get(&num).cloned())
-            .unwrap_or(Sender {
-                id: Some(PeerId::Node(num)),
-                long_name: None,
-                short_name: None,
-            })
+            .and_then(|names| names.get(&num).cloned());
+        let Some(known) = known else {
+            return Self::unnamed(num);
+        };
+        // A node in the database may still have no names: a radio that was never
+        // configured reports them empty. Either way the holes are filled, because
+        // a template is written once and has to render for every node.
+        let stand_in = Self::unnamed(num);
+        Sender {
+            id: known.id.or(stand_in.id),
+            long_name: filled(known.long_name).or(stand_in.long_name),
+            short_name: filled(known.short_name).or(stand_in.short_name),
+        }
+    }
+
+    /// What to call a node that has not said who it is, in the same words the
+    /// phone app uses: the address as the long name, and its last four hex digits
+    /// as the short one.
+    ///
+    /// Both are filled rather than left empty because they are what a prefix
+    /// template asks for by name. A template of `[{short}/{long}]` against a node
+    /// we cannot name would otherwise render as `[/]`, which says nothing at all
+    /// and looks like a bug in the relay rather than a nameless node.
+    fn unnamed(num: u32) -> Sender {
+        let hex = format!("{num:08x}");
+        Sender {
+            id: Some(PeerId::Node(num)),
+            short_name: Some(hex[4..].to_owned()),
+            long_name: Some(format!("!{hex}")),
+        }
     }
 
     fn remember_name(&self, node: &protobufs::NodeInfo) {
@@ -958,15 +989,60 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_sender_is_carried_by_number() {
+    fn an_unknown_sender_is_named_the_way_the_app_names_it() {
         let backend = offline_backend();
         let message = backend
-            .message(text_packet(0x1a2b_3c4d, BROADCAST_ADDR, 0, "hola"))
+            .message(text_packet(0xadb2_c99a, BROADCAST_ADDR, 0, "hola"))
             .expect("relayed even with nobody to name");
 
         let sender = message.sender.expect("the number is always there");
-        assert_eq!(sender.id, Some(PeerId::Node(0x1a2b_3c4d)));
-        assert_eq!(sender.display_name(), None);
+        assert_eq!(sender.id, Some(PeerId::Node(0xadb2_c99a)));
+        // Both filled, and not merely for tidiness: a prefix template asks for
+        // them by name, and `[{short}/{long}]` against empty ones renders `[/]`.
+        assert_eq!(sender.long_name.as_deref(), Some("!adb2c99a"));
+        assert_eq!(sender.short_name.as_deref(), Some("c99a"));
+        assert_eq!(sender.display_name(), Some("!adb2c99a"));
+    }
+
+    /// A radio that was never given a name reports empty strings rather than
+    /// leaving the fields out, which produces the same empty template.
+    #[test]
+    fn a_node_with_blank_names_is_treated_as_unnamed() {
+        let backend = offline_backend();
+        backend.absorb(protobufs::FromRadio {
+            payload_variant: Some(protobufs::from_radio::PayloadVariant::NodeInfo(node_info(
+                0xadb2_c99a,
+                "",
+                "",
+            ))),
+            ..Default::default()
+        });
+
+        let sender = backend.sender_of(0xadb2_c99a);
+        assert_eq!(sender.long_name.as_deref(), Some("!adb2c99a"));
+        assert_eq!(sender.short_name.as_deref(), Some("c99a"));
+    }
+
+    /// And a name we do have wins over the stand-in, one field at a time.
+    #[test]
+    fn a_real_name_is_never_replaced_by_an_address() {
+        let backend = offline_backend();
+        backend.absorb(protobufs::FromRadio {
+            payload_variant: Some(protobufs::from_radio::PayloadVariant::NodeInfo(node_info(
+                0xadb2_c99a,
+                "EA1CUE",
+                "",
+            ))),
+            ..Default::default()
+        });
+
+        let sender = backend.sender_of(0xadb2_c99a);
+        assert_eq!(sender.long_name.as_deref(), Some("EA1CUE"));
+        assert_eq!(
+            sender.short_name.as_deref(),
+            Some("c99a"),
+            "only the missing half is filled in"
+        );
     }
 
     /// The bug this was written for: the node database arrives while the session

@@ -120,9 +120,15 @@ Worth knowing, because it shows up in the output:
 - **Meshtastic** packets carry the sender's node number, resolved to a name
   against the radio's node database. That database only covers nodes the radio
   already knew when the relay connected, so a node that turns up afterwards is
-  learnt from the `NODEINFO_APP` packet it announces itself with. Until one
-  arrives it is named by its address, `!adb2c99a`, which is worse than a name and
-  much better than nothing.
+  learnt from the `NODEINFO_APP` packet it announces itself with.
+
+  Until one arrives — or for a radio whose names were never configured, which
+  reports them empty — the node is named the way the phone app names it: the
+  address as the long name and its last four hex digits as the short one, so
+  `!adb2c99a` and `c99a`. Both are filled rather than left blank because a prefix
+  template asks for them by name, and `[{short}/{long}]` against empty ones
+  renders as `[/]`, which looks like a broken relay rather than a nameless node.
+  A real name always wins, one field at a time.
 - **MeshCore** channel messages carry no sender identity at all. Every client
   makes up for that by writing the name into the text, as `NAME: MESSAGE`, so
   that is where the relay recovers it from — the first `": "` is the one the
