@@ -38,12 +38,21 @@ use crate::replies::{Posted, Replies};
 const DELIVERED: &str = "\u{2713}";
 const UNCONFIRMED: &str = "\u{26a0}";
 
-/// And on a broadcast, how many repeaters were heard carrying it. A count
+/// And on a broadcast, one of these per repeater heard carrying it. A dish
 /// rather than a tick, because this is what the air was overheard saying and
 /// not a confirmation from anybody: see [`Router::count_relays`].
+///
+/// Repeated rather than written as a number, because a client shows a reaction
+/// with a count of who sent it beside the key. Every reaction here comes from
+/// the one relay account, so that count is always 1 — and `📡 2` next to it
+/// reads as `📡 2 1`, which is nobody's idea of two repeaters.
 const REPEATED: &str = "\u{1f4e1}";
 /// Heard by no repeater at all, which on a mesh is worth knowing.
 const UNREPEATED: &str = "\u{1f4ed}";
+/// Where repeating the dish stops being legible. A radio hears the repeaters
+/// within range of it, which is a handful; past this the mark says "at least
+/// this many" rather than quietly rounding down, and the log has the figure.
+const MOST_DISHES: usize = 10;
 
 /// The name placeholders a template can ask for, worked out once from whatever
 /// the protocol actually carried.
@@ -708,11 +717,7 @@ impl Router {
             info!(network = %network, repeaters = heard, "heard being repeated");
             // Nobody repeating it is worth saying: on a mesh that is the
             // difference between a message that travelled and one that did not.
-            let key = if heard == 0 {
-                UNREPEATED.to_owned()
-            } else {
-                format!("{REPEATED} {heard}")
-            };
+            let key = dishes(heard);
             if let Err(error) = matrix.react(&room, &event, &key).await {
                 warn!(room = %room, %error, "could not mark what repeated a broadcast");
             }
@@ -940,6 +945,23 @@ fn require_backend(
         ),
         None => bail!("network {network:?} has no backend"),
     }
+}
+
+/// One dish per repeater, or the empty mailbox for none.
+///
+/// Past [`MOST_DISHES`] it says "at least that many" with a trailing `+` rather
+/// than rounding down to a number it can draw, since the alternative is a mark
+/// that is quietly wrong.
+fn dishes(heard: usize) -> String {
+    if heard == 0 {
+        return UNREPEATED.to_owned();
+    }
+    let drawn = heard.min(MOST_DISHES);
+    let mut key = REPEATED.repeat(drawn);
+    if heard > drawn {
+        key.push('+');
+    }
+    key
 }
 
 /// Enough of a message to recognize it when it is quoted back, and no more:
@@ -2165,6 +2187,24 @@ mod tests {
         assert!(excerpt(&"👍".repeat(60)).starts_with("👍👍"));
     }
 
+    /// A client draws a reaction with a count of who sent it beside the key, and
+    /// every reaction here comes from the one relay account. A number in the key
+    /// would sit next to that count and read as part of it.
+    #[test]
+    fn repeaters_are_drawn_rather_than_counted() {
+        assert_eq!(dishes(1), "📡");
+        assert_eq!(dishes(3), "📡📡📡");
+        assert_eq!(dishes(0), "📭", "none is its own mark, not an empty string");
+
+        // Beyond what is legible, say "at least" rather than round down.
+        assert_eq!(dishes(MOST_DISHES), REPEATED.repeat(MOST_DISHES));
+        assert_eq!(
+            dishes(MOST_DISHES + 1),
+            format!("{}+", REPEATED.repeat(MOST_DISHES)),
+            "a mark that is quietly wrong is worse than a long one"
+        );
+    }
+
     /// A broadcast cannot be confirmed by anybody, but repeaters carrying it can
     /// be overheard, and that is worth saying.
     #[tokio::test]
@@ -2180,7 +2220,7 @@ mod tests {
 
         assert_eq!(
             h.sink.awaits_a_reaction().await,
-            [("$typed:example.org".to_owned(), "📡 2".to_owned())]
+            [("$typed:example.org".to_owned(), "📡📡".to_owned())]
         );
     }
 

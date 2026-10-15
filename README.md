@@ -172,9 +172,16 @@ The result is marked on the Matrix message that caused it:
 
 | Mark | Means |
 | ---- | ----- |
-| 📡 2 | Two repeaters were heard carrying it. |
+| 📡📡 | Two repeaters were heard carrying it. |
 | 📭   | It was heard going out and no repeater carried it. |
 | none | It could not be told apart from other traffic. |
+
+One dish per repeater rather than a number, because a client draws a reaction
+with a count of who sent it beside the key. Every reaction here comes from the
+one relay account, so that count is always 1, and `📡 2` beside it reads as
+`📡 2 1`. A radio hears the repeaters within range of it, which is a handful;
+past ten the mark says `📡…📡+`, meaning at least that many, and the log has the
+figure.
 
 **This is an observation, not a confirmation**, and it is deliberately quiet
 when it cannot be sure. Nothing names a broadcast, so which echo is ours is
