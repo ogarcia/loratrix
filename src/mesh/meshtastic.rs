@@ -30,7 +30,8 @@ use tracing::{debug, info, trace, warn};
 
 use crate::config::{NetworkConfig, NetworkKind, Transport};
 use crate::mesh::{
-    Delivery, IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin, PeerId, Sender,
+    Broadcast, Delivery, IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin,
+    PeerId, Sender,
 };
 
 /// Every node, rather than one of them. Meshtastic has no constant for it.
@@ -692,15 +693,21 @@ impl MeshBackend for MeshtasticBackend {
         }
     }
 
+    /// No relay watch: a Meshtastic radio does not report the packets it merely
+    /// overhears, so there is no way to notice one of ours being repeated.
     async fn send_channel(
         &self,
         channel: u8,
         text: &str,
         reply_to: Option<MessageRef>,
-    ) -> Result<Option<MessageRef>> {
-        self.transmit(BROADCAST_ADDR, channel, text, reply_to, false)
-            .await
-            .map(Some)
+    ) -> Result<Broadcast> {
+        let reference = self
+            .transmit(BROADCAST_ADDR, channel, text, reply_to, false)
+            .await?;
+        Ok(Broadcast {
+            reference: Some(reference),
+            relays: None,
+        })
     }
 
     async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<Delivery> {

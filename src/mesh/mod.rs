@@ -139,6 +139,34 @@ pub struct Delivery {
     pub within: Duration,
 }
 
+/// A broadcast handed to a radio.
+#[derive(Debug, Default)]
+pub struct Broadcast {
+    /// What a reply to this message has to name, as [`MessageRef`] explains.
+    pub reference: Option<MessageRef>,
+    /// Where the protocol allows it to be observed, a way of finding out which
+    /// repeaters carried it. [`None`] where it cannot be.
+    pub relays: Option<RelayWatch>,
+}
+
+/// A watch on the repeaters that carry one broadcast.
+///
+/// Nothing in either protocol reports what becomes of a message sent to a
+/// channel: it is not acknowledged, and the radio says only that it accepted
+/// it. What can be done is to listen — a repeater that passes the message on
+/// transmits it again, and a radio in earshot hears that.
+///
+/// Which makes this an observation rather than a confirmation, and it is
+/// reported as one. Ask [`MeshBackend::relays_heard`] once `within` has passed.
+#[derive(Debug)]
+pub struct RelayWatch {
+    /// Identifies this broadcast to the backend watching for it.
+    pub id: u64,
+    /// How long to listen before deciding. A repeater takes a second or two to
+    /// pass a message on, and anything arriving long after is somebody else's.
+    pub within: Duration,
+}
+
 /// Where a received message came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(
@@ -246,7 +274,7 @@ pub trait MeshBackend: Send + Sync {
 
     /// Broadcast on a channel, optionally as a reply to a message already there.
     ///
-    /// Returns what a reply to *this* message would have to name, so the router
+    /// Reports what a reply to *this* message would have to name, so the router
     /// can tie it to the Matrix event it came from. A backend asked for a reply
     /// it cannot express sends the text plainly rather than failing: a message
     /// delivered without its thread beats no message at all.
@@ -255,7 +283,19 @@ pub trait MeshBackend: Send + Sync {
         channel: u8,
         text: &str,
         reply_to: Option<MessageRef>,
-    ) -> Result<Option<MessageRef>>;
+    ) -> Result<Broadcast>;
+
+    /// How many repeaters were heard carrying a broadcast, once its watch has
+    /// run its course.
+    ///
+    /// [`None`] means no answer rather than none heard: the backend could not
+    /// tell our message apart from other traffic on the air, and saying "nobody
+    /// repeated it" would be a different claim entirely. `Some(0)` is that
+    /// claim, and an honest one.
+    async fn relays_heard(&self, watch: &RelayWatch) -> Option<usize> {
+        let _ = watch;
+        None
+    }
 
     /// Send a direct message to a peer.
     ///

@@ -18,14 +18,15 @@ use std::time::Instant;
 
 use anyhow::{Result, bail};
 use tokio::sync::Mutex;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, RelayConfig, Route};
 use crate::dedupe::{Dedupe, message_key};
 use crate::matrix::{MatrixMessage, MatrixSink, MsgKind, RoomId};
 use crate::mesh::{
-    Delivery, IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin, PeerId, Sender,
+    Delivery, IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin, PeerId,
+    RelayWatch, Sender,
 };
 use crate::prefix::{self, Vars};
 use crate::replies::{Posted, Replies};
@@ -36,6 +37,13 @@ use crate::replies::{Posted, Replies};
 /// the message mean the same thing.
 const DELIVERED: &str = "\u{2713}";
 const UNCONFIRMED: &str = "\u{26a0}";
+
+/// And on a broadcast, how many repeaters were heard carrying it. A count
+/// rather than a tick, because this is what the air was overheard saying and
+/// not a confirmation from anybody: see [`Router::count_relays`].
+const REPEATED: &str = "\u{1f4e1}";
+/// Heard by no repeater at all, which on a mesh is worth knowing.
+const UNREPEATED: &str = "\u{1f4ed}";
 
 /// The name placeholders a template can ask for, worked out once from whatever
 /// the protocol actually carried.
@@ -502,7 +510,7 @@ impl Router {
                         text = %payload,
                         "mesh -> mesh"
                     );
-                    if let (Some(event), Some(id)) = (event, sent) {
+                    if let (Some(event), Some(id)) = (event, sent.reference) {
                         self.replies
                             .lock()
                             .await
@@ -667,6 +675,50 @@ impl Router {
         }
     }
 
+    /// Listen for the repeaters carrying a broadcast, and mark what was heard.
+    ///
+    /// In a task of its own, like [`confirm`], because the window is seconds
+    /// long and the relay has other messages to carry meanwhile.
+    ///
+    /// Unlike the tick on a direct message, this is an **observation, not a
+    /// confirmation**: no protocol here reports what became of a broadcast, so
+    /// what is marked is what the radio overheard. When the backend cannot tell
+    /// our message apart from other traffic, nothing is marked at all — a guess
+    /// dressed as a count would be worse than silence.
+    ///
+    /// [`confirm`]: Router::confirm
+    fn count_relays(
+        &self,
+        backend: Arc<dyn MeshBackend>,
+        watch: RelayWatch,
+        room: &str,
+        event: &str,
+        network: NetworkId,
+    ) {
+        let matrix = Arc::clone(&self.matrix);
+        let room = room.to_owned();
+        let event = event.to_owned();
+        tokio::spawn(async move {
+            sleep(watch.within).await;
+            let Some(heard) = backend.relays_heard(&watch).await else {
+                debug!(network = %network, "could not tell which message was ours");
+                return;
+            };
+
+            info!(network = %network, repeaters = heard, "heard being repeated");
+            // Nobody repeating it is worth saying: on a mesh that is the
+            // difference between a message that travelled and one that did not.
+            let key = if heard == 0 {
+                UNREPEATED.to_owned()
+            } else {
+                format!("{REPEATED} {heard}")
+            };
+            if let Err(error) = matrix.react(&room, &event, &key).await {
+                warn!(room = %room, %error, "could not mark what repeated a broadcast");
+            }
+        });
+    }
+
     /// Wait for a direct message to be acknowledged and mark the answer in Matrix
     /// accordingly.
     ///
@@ -801,12 +853,21 @@ impl Router {
                     );
                     // And this message becomes something that can be replied to
                     // in turn.
-                    if let Some(reference) = sent {
+                    if let Some(reference) = sent.reference.clone() {
                         self.replies.lock().await.remember(
                             &message.event_id,
                             &route.network,
                             reference,
                             now,
+                        );
+                    }
+                    if let Some(watch) = sent.relays {
+                        self.count_relays(
+                            Arc::clone(backend),
+                            watch,
+                            &message.room_id,
+                            &message.event_id,
+                            route.network.clone(),
                         );
                     }
                 }
@@ -914,7 +975,7 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     use super::*;
-    use crate::mesh::{MeshKind, PeerId, Sender};
+    use crate::mesh::{Broadcast, MeshKind, PeerId, Sender};
 
     /// Records what it was asked to transmit instead of touching a radio.
     ///
@@ -931,6 +992,9 @@ mod tests {
         /// What the mesh does with the next direct message: acknowledge it,
         /// refuse it, or never answer at all.
         ack: Mutex<Option<bool>>,
+        /// What the watch on the next broadcast reports: a count, or `None` for
+        /// "could not tell which message was ours".
+        relays: Mutex<Option<usize>>,
     }
 
     impl FakeBackend {
@@ -942,6 +1006,7 @@ mod tests {
                 sent: Mutex::new(Vec::new()),
                 dms: Mutex::new(Vec::new()),
                 ack: Mutex::new(Some(true)),
+                relays: Mutex::new(Some(0)),
             })
         }
 
@@ -964,6 +1029,11 @@ mod tests {
         /// so the wait times out.
         async fn answers_with(&self, ack: Option<bool>) {
             *self.ack.lock().await = ack;
+        }
+
+        /// What the next broadcast's watch will report.
+        async fn repeated_by(&self, heard: Option<usize>) {
+            *self.relays.lock().await = heard;
         }
 
         /// What each of those was a reply to.
@@ -1011,10 +1081,10 @@ mod tests {
             channel: u8,
             text: &str,
             reply_to: Option<MessageRef>,
-        ) -> Result<Option<MessageRef>> {
+        ) -> Result<Broadcast> {
             let mut sent = self.sent.lock().await;
             sent.push((channel, text.to_owned(), reply_to));
-            Ok(match self.kind {
+            let reference = match self.kind {
                 MeshKind::Meshtastic => Some(MessageRef::Packet(
                     u32::try_from(sent.len()).expect("few sends in a test"),
                 )),
@@ -1023,7 +1093,21 @@ mod tests {
                 MeshKind::MeshCore => text
                     .split_once(": ")
                     .map(|(name, _)| MessageRef::Author(name.to_owned())),
+            };
+            Ok(Broadcast {
+                reference,
+                // As the real backends: only MeshCore can overhear repeaters.
+                relays: (self.kind == MeshKind::MeshCore).then(|| RelayWatch {
+                    id: 0,
+                    // Short, because a test that waits out a real watch is a
+                    // test nobody runs.
+                    within: Duration::from_millis(20),
+                }),
             })
+        }
+
+        async fn relays_heard(&self, _watch: &RelayWatch) -> Option<usize> {
+            *self.relays.lock().await
         }
 
         async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<Delivery> {
@@ -2079,6 +2163,77 @@ mod tests {
         assert!(cut.ends_with('…'));
         // Emoji are several bytes each, and cutting one in half is unrenderable.
         assert!(excerpt(&"👍".repeat(60)).starts_with("👍👍"));
+    }
+
+    /// A broadcast cannot be confirmed by anybody, but repeaters carrying it can
+    /// be overheard, and that is worth saying.
+    #[tokio::test]
+    async fn a_broadcast_is_marked_with_the_repeaters_heard() {
+        let h = harness(BRIDGED_ROOM);
+        h.mc.repeated_by(Some(2)).await;
+        h.router
+            .handle_matrix(
+                from_matrix("!room:example.org", "@bob:example.org", "hola"),
+                Instant::now(),
+            )
+            .await;
+
+        assert_eq!(
+            h.sink.awaits_a_reaction().await,
+            [("$typed:example.org".to_owned(), "📡 2".to_owned())]
+        );
+    }
+
+    /// Nobody repeating it is a fact of its own: the message reached whoever was
+    /// in earshot and went no further.
+    #[tokio::test]
+    async fn a_broadcast_nobody_repeated_is_marked_too() {
+        let h = harness(BRIDGED_ROOM);
+        h.mc.repeated_by(Some(0)).await;
+        h.router
+            .handle_matrix(
+                from_matrix("!room:example.org", "@bob:example.org", "hola"),
+                Instant::now(),
+            )
+            .await;
+
+        assert_eq!(
+            h.sink.awaits_a_reaction().await,
+            [("$typed:example.org".to_owned(), "📭".to_owned())]
+        );
+    }
+
+    /// The air was busy and the backend could not tell which message was ours.
+    /// A count here would be a guess, and a guess is worse than silence.
+    #[tokio::test]
+    async fn an_unidentifiable_broadcast_is_not_marked_at_all() {
+        let h = harness(BRIDGED_ROOM);
+        h.mc.repeated_by(None).await;
+        h.router
+            .handle_matrix(
+                from_matrix("!room:example.org", "@bob:example.org", "hola"),
+                Instant::now(),
+            )
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(h.sink.reactions().await.is_empty());
+    }
+
+    /// Meshtastic radios do not report what they merely overhear, so there is
+    /// nothing to watch and nothing to claim.
+    #[tokio::test]
+    async fn a_meshtastic_broadcast_is_never_marked() {
+        let h = harness(ONE_ROOM);
+        h.router
+            .handle_matrix(
+                from_matrix("!room:example.org", "@bob:example.org", "hola"),
+                Instant::now(),
+            )
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(h.sink.reactions().await.is_empty());
     }
 
     /// A direct message is the one thing here that can be confirmed to have

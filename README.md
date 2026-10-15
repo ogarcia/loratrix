@@ -33,6 +33,8 @@ arriving back and being parsed, and 80 real Matrix events read.
   message, in whichever way the protocol there expresses one.
 - Reactions from Meshtastic reach Matrix, as a reaction where that says the
   truth and as an emote where it would not.
+- On MeshCore, a broadcast is marked with the repeaters overheard carrying it,
+  which is the nearest thing that protocol has to a delivery report.
 
 Deliberately out of scope: media, plugins, message history, and reactions
 written in Matrix travelling to the mesh.
@@ -151,6 +153,43 @@ attached nothing else can be. If you want to keep using a phone app against the
 same radio, put a multiplexer in front of it — for MeshCore,
 [coresplitter](https://github.com/ogarcia/coresplitter) does exactly that — and
 point `transport` at the multiplexer instead.
+
+## How far a broadcast travelled
+
+Nothing acknowledges a message sent to a channel. The radio says it accepted it
+and that is the end of the protocol's account — a MeshCore radio does not even
+report when it transmits. So the question "did anyone repeat that?" has no
+answer to ask for, only one to overhear.
+
+What the relay does on MeshCore is listen. A repeater passing the message on
+transmits it again, and the radio hears that, with the repeater's hash appended
+to the path. For twelve seconds after a broadcast, channel packets that have
+been through at least one repeater are collected and grouped by payload
+fingerprint — which works because repeaters dedupe a flood by hashing the
+payload with the path excluded, so those bytes stay put while the path grows.
+
+The result is marked on the Matrix message that caused it:
+
+| Mark | Means |
+| ---- | ----- |
+| 📡 2 | Two repeaters were heard carrying it. |
+| 📭   | It was heard going out and no repeater carried it. |
+| none | It could not be told apart from other traffic. |
+
+**This is an observation, not a confirmation**, and it is deliberately quiet
+when it cannot be sure. Nothing names a broadcast, so which echo is ours is
+inferred, and only where the inference is safe: exactly one message heard being
+repeated, and no other broadcast of ours sharing the air. Two messages in flight
+and an echo belongs to either, so neither claims it, and nothing is marked.
+
+Two further limits, both the mesh's rather than the relay's. Some repeaters
+forward a packet without updating its path, and those cannot be counted at all.
+And a repeater out of earshot of this radio is one whose work is invisible here,
+however well it served everyone else. The count is what *this* radio heard,
+never what the mesh did.
+
+Meshtastic has none of this: its radios do not report the packets they merely
+overhear, so a broadcast there is marked with nothing.
 
 ## Watching what is actually on the air
 

@@ -14,8 +14,9 @@
 //! for us. Anything queued from before we connected has to be drained by hand,
 //! because that announcement has already been and gone.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex as SyncMutex, RwLock as SyncRwLock};
 use std::time::Duration;
 
@@ -29,7 +30,8 @@ use tracing::{debug, info, trace, warn};
 
 use crate::config::{NetworkConfig, NetworkKind, Transport};
 use crate::mesh::{
-    Delivery, IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin, PeerId, Sender,
+    Broadcast, Delivery, IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin,
+    PeerId, RelayWatch, Sender,
 };
 
 /// Conservative text budget. MeshCore does not expose a payload constant the way
@@ -51,6 +53,31 @@ const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(60);
 /// of them on the mesh this was written against — so a stranger sending several
 /// messages must not cost one fetch each.
 const NAME_REFRESH_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// How long to listen for repeaters after broadcasting, before deciding what
+/// was heard. A repeater passes a message on within a second or two; well past
+/// that and what arrives is somebody else's traffic.
+const RELAY_WATCH: Duration = Duration::from_secs(12);
+
+/// A broadcast of ours, and the echoes heard while its watch is open.
+///
+/// The echoes are grouped by payload fingerprint because that is what stays the
+/// same as a message is passed along: repeaters dedupe a flood by hashing the
+/// payload with the path excluded, so the path grows while those bytes do not.
+///
+/// Which message is ours cannot be asked of the radio — nothing in the protocol
+/// names a broadcast — so it is inferred, and only where the inference is safe:
+/// exactly one message heard being repeated during the watch. Two, and either
+/// could be ours; none, and nobody repeated it.
+#[derive(Default)]
+struct RelayEchoes {
+    /// Payload fingerprint -> the repeaters seen carrying it.
+    heard: HashMap<u64, HashSet<Vec<u8>>>,
+    /// Whether another broadcast of ours shared the air with this one. Two
+    /// messages in flight and one echo heard is an echo that belongs to either,
+    /// so neither watch may claim it.
+    overlapped: bool,
+}
 
 /// How a MeshCore client marks a reply. The protocol has no field for it, so the
 /// convention is the same one that carries the sender's name: it goes in the
@@ -107,9 +134,14 @@ fn hops(header: &MeshPacketHeader) -> String {
 /// A hash rather than the bytes: they are encrypted, they are most of the
 /// packet, and nothing here needs to read them — only to tell one from another.
 fn fingerprint(payload: &[u8]) -> String {
+    format!("{:08x}", fingerprint_key(payload) as u32)
+}
+
+/// The same thing unformatted, for keying what was heard.
+fn fingerprint_key(payload: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     payload.hash(&mut hasher);
-    format!("{:08x}", hasher.finish() as u32)
+    hasher.finish()
 }
 
 /// Where the companion radio is and how to reach it.
@@ -161,6 +193,10 @@ pub struct MeshCoreBackend {
     /// Direct messages waiting to be acknowledged, by the tag the radio said to
     /// expect. The acknowledgement arrives later, as an event of its own.
     awaiting_ack: SyncMutex<HashMap<[u8; 4], oneshot::Sender<bool>>>,
+    /// Broadcasts whose repeaters we are still listening for, by watch id.
+    watching: SyncMutex<HashMap<u64, RelayEchoes>>,
+    /// Hands out those ids. Only has to be unique among the open watches.
+    next_watch: AtomicU64,
 }
 
 impl MeshCoreBackend {
@@ -199,6 +235,8 @@ impl MeshCoreBackend {
             next_send: Mutex::new(None),
             names_read_at: Mutex::new(None),
             awaiting_ack: SyncMutex::new(HashMap::new()),
+            watching: SyncMutex::new(HashMap::new()),
+            next_watch: AtomicU64::new(0),
         })
     }
 
@@ -424,6 +462,64 @@ impl MeshCoreBackend {
             bytes = log.payload.len(),
             "rf"
         );
+        self.note_echo(header, &log.payload);
+    }
+
+    /// Offer an overheard packet to every open relay watch.
+    ///
+    /// Only a channel message that has been through at least one repeater is of
+    /// any interest: a packet straight from its sender has been repeated by
+    /// nobody, and anything that is not a channel message cannot be ours.
+    fn note_echo(&self, header: &MeshPacketHeader, payload: &[u8]) {
+        if !matches!(header.payload_type, meshcore_rs::PayloadType::GroupText)
+            || header.path_len == 0
+        {
+            return;
+        }
+        let Ok(mut watching) = self.watching.lock() else {
+            warn!(network = %self.id, "the relay watch lock is poisoned");
+            return;
+        };
+        if watching.is_empty() {
+            return;
+        }
+
+        let packet = fingerprint_key(payload);
+        let size = usize::from(header.path_hash_size).max(1);
+        for echoes in watching.values_mut() {
+            let carried = echoes.heard.entry(packet).or_default();
+            for hop in header.path.chunks(size) {
+                carried.insert(hop.to_vec());
+            }
+        }
+    }
+
+    /// Start listening for repeaters carrying what is about to go out.
+    fn watch_relays(&self) -> RelayWatch {
+        let id = self.next_watch.fetch_add(1, Ordering::Relaxed);
+        match self.watching.lock() {
+            Ok(mut watching) => {
+                // Anything already listening now shares the air with this, and
+                // so does this with it. Marked both ways, because an echo
+                // arriving from here on could belong to either.
+                let crowded = !watching.is_empty();
+                for other in watching.values_mut() {
+                    other.overlapped = true;
+                }
+                watching.insert(
+                    id,
+                    RelayEchoes {
+                        overlapped: crowded,
+                        ..RelayEchoes::default()
+                    },
+                );
+            }
+            Err(_) => warn!(network = %self.id, "the relay watch lock is poisoned"),
+        }
+        RelayWatch {
+            id,
+            within: RELAY_WATCH,
+        }
     }
 
     /// Resolve a sender prefix to an advertised name.
@@ -591,9 +687,12 @@ impl MeshBackend for MeshCoreBackend {
         channel: u8,
         text: &str,
         _reply_to: Option<MessageRef>,
-    ) -> Result<Option<MessageRef>> {
+    ) -> Result<Broadcast> {
         let client = self.connected().await?;
         self.pace().await;
+        // Opened before the message goes out, because a repeater is quick and
+        // an echo arriving before we were listening is an echo missed.
+        let relays = self.watch_relays();
         client
             .as_ref()
             .expect("checked just above")
@@ -608,7 +707,10 @@ impl MeshBackend for MeshCoreBackend {
         // same way a received message is read. Whatever the prefix template put
         // there is what other clients will show as the sender, so it is also what
         // they will answer.
-        Ok(split_sender(text).map(|(name, _)| MessageRef::Author(name.to_owned())))
+        Ok(Broadcast {
+            reference: split_sender(text).map(|(name, _)| MessageRef::Author(name.to_owned())),
+            relays: Some(relays),
+        })
     }
 
     async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<Delivery> {
@@ -644,6 +746,45 @@ impl MeshBackend for MeshCoreBackend {
             ack,
             within: Duration::from_millis(u64::from(sent.suggested_timeout)),
         })
+    }
+
+    /// What the watch heard, and whether it can be believed.
+    ///
+    /// One message repeated during the window is taken to be ours. Two means
+    /// the air was busy and either could have been, which is reported as no
+    /// answer rather than as a guess — see [`MeshBackend::relays_heard`].
+    async fn relays_heard(&self, watch: &RelayWatch) -> Option<usize> {
+        let echoes = match self.watching.lock() {
+            Ok(mut watching) => watching.remove(&watch.id)?,
+            Err(_) => {
+                warn!(network = %self.id, "the relay watch lock is poisoned");
+                return None;
+            }
+        };
+
+        if echoes.overlapped {
+            debug!(
+                network = %self.id,
+                "another broadcast shared the air; cannot tell which echo was ours"
+            );
+            return None;
+        }
+
+        match echoes.heard.len() {
+            0 => Some(0),
+            1 => {
+                let carried = echoes.heard.into_values().next()?;
+                Some(carried.len())
+            }
+            several => {
+                debug!(
+                    network = %self.id,
+                    messages = several,
+                    "several messages were repeated at once; cannot tell which was ours"
+                );
+                None
+            }
+        }
     }
 
     fn resolve_name(&self, peer: &PeerId) -> Option<String> {
@@ -728,6 +869,138 @@ mod tests {
         .await;
 
         assert!(relayed.is_none());
+    }
+
+    fn offline() -> MeshCoreBackend {
+        backend(Transport::Tcp {
+            host: "127.0.0.1".to_owned(),
+            port: None,
+        })
+    }
+
+    /// An overheard channel packet, as the radio reports one.
+    fn overheard(payload: &[u8], hops: &[&[u8]], hash_size: u8) -> LogData {
+        LogData {
+            snr: 11.0,
+            rssi: -90,
+            header: Some(MeshPacketHeader {
+                route_type: meshcore_rs::RouteType::Flood,
+                payload_type: meshcore_rs::PayloadType::GroupText,
+                payload_version: 1,
+                transport_code: None,
+                path_len: u8::try_from(hops.len()).unwrap_or(0),
+                path_hash_size: hash_size,
+                path: hops.concat(),
+            }),
+            advertisement: None,
+            payload: payload.to_vec(),
+        }
+    }
+
+    /// The whole point: our message comes back carried by a repeater, and that
+    /// repeater is what the watch counts.
+    #[tokio::test]
+    async fn a_repeated_broadcast_counts_its_repeaters() {
+        let backend = offline();
+        let watch = backend.watch_relays();
+
+        // The same message heard twice, from two different repeaters.
+        backend.log_rf(&overheard(b"encrypted", &[&[0x1e, 0x35]], 2));
+        backend.log_rf(&overheard(b"encrypted", &[&[0xa3, 0x01]], 2));
+
+        assert_eq!(backend.relays_heard(&watch).await, Some(2));
+    }
+
+    /// One repeater heard twice is still one repeater.
+    #[tokio::test]
+    async fn the_same_repeater_twice_is_counted_once() {
+        let backend = offline();
+        let watch = backend.watch_relays();
+
+        backend.log_rf(&overheard(b"encrypted", &[&[0x1e, 0x35]], 2));
+        backend.log_rf(&overheard(b"encrypted", &[&[0x1e, 0x35]], 2));
+
+        assert_eq!(backend.relays_heard(&watch).await, Some(1));
+    }
+
+    /// Nothing repeated it, which is a count rather than an absence of one.
+    #[tokio::test]
+    async fn a_broadcast_nobody_carried_is_zero_not_unknown() {
+        let backend = offline();
+        let watch = backend.watch_relays();
+
+        assert_eq!(backend.relays_heard(&watch).await, Some(0));
+    }
+
+    /// Two messages being repeated at once, and no way to tell which was ours.
+    /// Reported as no answer rather than as a number picked between them.
+    #[tokio::test]
+    async fn two_messages_at_once_cannot_be_told_apart() {
+        let backend = offline();
+        let watch = backend.watch_relays();
+
+        backend.log_rf(&overheard(b"ours, probably", &[&[0x1e, 0x35]], 2));
+        backend.log_rf(&overheard(b"somebody else's", &[&[0xa3, 0x01]], 2));
+
+        assert_eq!(backend.relays_heard(&watch).await, None);
+    }
+
+    /// A packet straight from its sender has been through no repeater, so it
+    /// says nothing about ours having travelled.
+    #[tokio::test]
+    async fn a_packet_that_was_never_repeated_is_not_an_echo() {
+        let backend = offline();
+        let watch = backend.watch_relays();
+
+        backend.log_rf(&overheard(b"straight from the sender", &[], 1));
+
+        assert_eq!(backend.relays_heard(&watch).await, Some(0));
+    }
+
+    /// Only channel messages can be ours; a repeated advert is somebody saying
+    /// who they are.
+    #[tokio::test]
+    async fn other_traffic_is_not_mistaken_for_our_message() {
+        let backend = offline();
+        let watch = backend.watch_relays();
+
+        let mut advert = overheard(b"an advert", &[&[0x1e, 0x35]], 2);
+        if let Some(header) = advert.header.as_mut() {
+            header.payload_type = meshcore_rs::PayloadType::Advert;
+        }
+        backend.log_rf(&advert);
+
+        assert_eq!(backend.relays_heard(&watch).await, Some(0));
+    }
+
+    /// Two broadcasts in flight at once: an echo arriving then belongs to
+    /// either, so neither watch may claim it. Better no answer than two
+    /// messages claiming the same repeater.
+    #[tokio::test]
+    async fn overlapping_watches_do_not_claim_each_other_echoes() {
+        let backend = offline();
+        let first = backend.watch_relays();
+        backend.log_rf(&overheard(b"the first", &[&[0x1e, 0x35]], 2));
+
+        let second = backend.watch_relays();
+        backend.log_rf(&overheard(b"the second", &[&[0xa3, 0x01]], 2));
+
+        assert_eq!(
+            backend.relays_heard(&first).await,
+            None,
+            "the first watch saw both and cannot choose"
+        );
+        assert_eq!(backend.relays_heard(&second).await, None);
+    }
+
+    /// Asking twice is asking about a watch that is over.
+    #[tokio::test]
+    async fn a_watch_is_spent_once_it_is_read() {
+        let backend = offline();
+        let watch = backend.watch_relays();
+
+        assert_eq!(backend.relays_heard(&watch).await, Some(0));
+        assert_eq!(backend.relays_heard(&watch).await, None);
     }
 
     #[test]
