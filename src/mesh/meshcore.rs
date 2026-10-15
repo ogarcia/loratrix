@@ -15,11 +15,13 @@
 //! because that announcement has already been and gone.
 
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Mutex as SyncMutex, RwLock as SyncRwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use meshcore_rs::events::{LogData, MeshPacketHeader};
 use meshcore_rs::{EventPayload, EventType, MeshCore};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use tokio::time::{Instant, sleep, sleep_until};
@@ -83,6 +85,31 @@ fn split_sender(text: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((name, body))
+}
+
+/// The repeaters a packet has been through, as the hashes each one appended.
+///
+/// Written apart rather than as one run of hex, because the boundaries are the
+/// point: `a3-7f` is two repeaters, and the hop size is the radio's to choose.
+fn hops(header: &MeshPacketHeader) -> String {
+    let size = usize::from(header.path_hash_size).max(1);
+    header
+        .path
+        .chunks(size)
+        .map(|hop| hop.iter().map(|byte| format!("{byte:02x}")).collect())
+        .collect::<Vec<String>>()
+        .join("-")
+}
+
+/// A short name for an opaque payload, so the same packet can be recognized
+/// each time a repeater passes it on.
+///
+/// A hash rather than the bytes: they are encrypted, they are most of the
+/// packet, and nothing here needs to read them — only to tell one from another.
+fn fingerprint(payload: &[u8]) -> String {
+    let mut hasher = DefaultHasher::new();
+    payload.hash(&mut hasher);
+    format!("{:08x}", hasher.finish() as u32)
 }
 
 /// Where the companion radio is and how to reach it.
@@ -310,6 +337,13 @@ impl MeshCoreBackend {
                     reacts_to: None,
                 })
             }
+            // Every packet the radio hears, whoever it was for. Not relayed —
+            // it is a diagnostic, and the only window this protocol gives onto
+            // what is actually on the air.
+            EventPayload::LogData(log) => {
+                self.log_rf(log);
+                None
+            }
             // A direct message of ours reached the far node. The tag is the one
             // the radio told us to expect when it took the message.
             EventPayload::Ack { tag } => {
@@ -334,6 +368,52 @@ impl MeshCoreBackend {
                 None
             }
         }
+    }
+
+    /// Report a packet the radio overheard.
+    ///
+    /// MeshCore gives no account of what became of a message once it is sent: a
+    /// channel broadcast is answered by nothing, and the radio reports only that
+    /// it accepted it. This is the one way round that — the firmware pushes a
+    /// record of *every* packet it hears, repeaters included, so a message of
+    /// ours coming back retransmitted shows up here with the repeater that
+    /// carried it appended to its path.
+    ///
+    /// Kept on a target of its own, `loratrix::rf`, because on a busy mesh it is
+    /// a line per packet and nobody wants it by accident:
+    ///
+    /// ```sh
+    /// RUST_LOG=loratrix=info,loratrix::rf=trace loratrix
+    /// ```
+    ///
+    /// The payload of a message is encrypted and stays that way; `packet` is a
+    /// fingerprint of those bytes, which is what makes the same packet
+    /// recognizable across the hops that repeat it.
+    fn log_rf(&self, log: &LogData) {
+        let Some(header) = log.header.as_ref() else {
+            trace!(
+                target: "loratrix::rf",
+                network = %self.id,
+                snr = log.snr,
+                rssi = log.rssi,
+                bytes = log.payload.len(),
+                "a packet too short to read a header from"
+            );
+            return;
+        };
+        trace!(
+            target: "loratrix::rf",
+            network = %self.id,
+            route = ?header.route_type,
+            payload = ?header.payload_type,
+            hops = header.path_len,
+            path = %hops(header),
+            packet = %fingerprint(&log.payload),
+            snr = log.snr,
+            rssi = log.rssi,
+            bytes = log.payload.len(),
+            "rf"
+        );
     }
 
     /// Resolve a sender prefix to an advertised name.
@@ -578,6 +658,66 @@ mod tests {
 
     fn backend(transport: Transport) -> MeshCoreBackend {
         MeshCoreBackend::new(&network(transport)).expect("valid transport")
+    }
+
+    /// The repeater hashes are what say how far a packet has travelled, so the
+    /// boundaries between them have to survive being printed.
+    #[test]
+    fn hops_are_printed_one_repeater_at_a_time() {
+        let header = |size: u8, path: Vec<u8>| MeshPacketHeader {
+            route_type: meshcore_rs::RouteType::Flood,
+            payload_type: meshcore_rs::PayloadType::GroupText,
+            payload_version: 0,
+            transport_code: None,
+            path_len: u8::try_from(path.len()).unwrap_or(0) / size.max(1),
+            path_hash_size: size,
+            path,
+        };
+
+        assert_eq!(hops(&header(1, vec![0xa3, 0x7f])), "a3-7f");
+        assert_eq!(
+            hops(&header(2, vec![0xa3, 0x7f, 0x01, 0x02])),
+            "a37f-0102",
+            "a two-byte hash is one repeater, not two"
+        );
+        assert_eq!(hops(&header(1, Vec::new())), "", "straight from the sender");
+    }
+
+    /// What makes a retransmission recognizable as the same packet: the payload
+    /// is encrypted and unchanged, only the path grows.
+    #[test]
+    fn the_same_payload_keeps_its_fingerprint() {
+        let payload = b"an encrypted channel message".to_vec();
+        assert_eq!(fingerprint(&payload), fingerprint(&payload.clone()));
+        assert_ne!(fingerprint(&payload), fingerprint(b"something else"));
+        assert_eq!(
+            fingerprint(&payload).len(),
+            8,
+            "short enough to read in a log"
+        );
+    }
+
+    /// Heard, logged, and not relayed: it is somebody else's traffic, or our own
+    /// coming back, and neither is a message for Matrix.
+    #[tokio::test]
+    async fn an_overheard_packet_is_not_a_message() {
+        let relayed = backend(Transport::Tcp {
+            host: "127.0.0.1".to_owned(),
+            port: None,
+        })
+        .convert(&meshcore_rs::MeshCoreEvent::new(
+            EventType::LogData,
+            EventPayload::LogData(LogData {
+                snr: 10.5,
+                rssi: -80,
+                header: None,
+                advertisement: None,
+                payload: vec![1, 2, 3],
+            }),
+        ))
+        .await;
+
+        assert!(relayed.is_none());
     }
 
     #[test]

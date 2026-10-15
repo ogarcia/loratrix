@@ -152,6 +152,39 @@ same radio, put a multiplexer in front of it — for MeshCore,
 [coresplitter](https://github.com/ogarcia/coresplitter) does exactly that — and
 point `transport` at the multiplexer instead.
 
+## Watching what is actually on the air
+
+MeshCore gives no account of what becomes of a message once it is sent. A
+channel broadcast is answered by nothing, and the radio reports only that it
+accepted it — so "did anyone repeat that?" has no direct answer.
+
+What the firmware does offer is a record of **every packet its radio hears**,
+whoever it was for. The relay logs those on a target of its own:
+
+```sh
+RUST_LOG=loratrix=info,loratrix::rf=trace loratrix
+```
+
+```text
+TRACE loratrix::rf: rf network=mc route=Flood payload=GroupText hops=0
+      path= packet=3f2a9c01 snr=11.5 rssi=-78 bytes=42
+TRACE loratrix::rf: rf network=mc route=Flood payload=GroupText hops=1
+      path=a3 packet=3f2a9c01 snr=8.25 rssi=-91 bytes=42
+```
+
+Those two lines are one message: the same `packet` fingerprint, heard first
+direct from its sender and then again a couple of seconds later with repeater
+`a3` appended to its path. That is how far it travelled, and reading it off the
+air is the only way to know.
+
+The payload of a message is encrypted and stays that way; `packet` is a hash of
+those bytes, which is enough to recognize the same packet across the hops that
+repeat it without reading any of it.
+
+It is a line per packet, so on a busy mesh it is a lot of lines — hence the
+separate target, which keeps it out of an ordinary `loratrix=debug`. Meshtastic
+has no equivalent here; this is MeshCore only.
+
 ## Replies are two conventions, not one feature
 
 Answer a message in Matrix and the answer reaches the mesh as an answer. What
