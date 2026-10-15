@@ -363,8 +363,18 @@ impl MeshCoreBackend {
                 }
                 None
             }
-            _ => {
-                trace!(network = %self.id, event = ?event.event_type, "ignored");
+            // Everything else the radio says. Logged with its contents rather
+            // than merely counted, and on the diagnostic target, because what
+            // this protocol reports and when is not written down anywhere and
+            // the only way to find out is to watch it.
+            other => {
+                trace!(
+                    target: "loratrix::rf",
+                    network = %self.id,
+                    event = ?event.event_type,
+                    payload = ?other,
+                    "unused"
+                );
                 None
             }
         }
