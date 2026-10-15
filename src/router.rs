@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use anyhow::{Result, bail};
 use tokio::sync::Mutex;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, RelayConfig, Route};
@@ -686,8 +686,8 @@ impl Router {
 
     /// Listen for the repeaters carrying a broadcast, and mark what was heard.
     ///
-    /// In a task of its own, like [`confirm`], because the window is seconds
-    /// long and the relay has other messages to carry meanwhile.
+    /// In a task of its own, like [`confirm`], because the backend listens for
+    /// seconds and the relay has other messages to carry meanwhile.
     ///
     /// Unlike the tick on a direct message, this is an **observation, not a
     /// confirmation**: no protocol here reports what became of a broadcast, so
@@ -696,20 +696,12 @@ impl Router {
     /// dressed as a count would be worse than silence.
     ///
     /// [`confirm`]: Router::confirm
-    fn count_relays(
-        &self,
-        backend: Arc<dyn MeshBackend>,
-        watch: RelayWatch,
-        room: &str,
-        event: &str,
-        network: NetworkId,
-    ) {
+    fn count_relays(&self, watch: RelayWatch, room: &str, event: &str, network: NetworkId) {
         let matrix = Arc::clone(&self.matrix);
         let room = room.to_owned();
         let event = event.to_owned();
         tokio::spawn(async move {
-            sleep(watch.within).await;
-            let Some(heard) = backend.relays_heard(&watch).await else {
+            let Ok(Some(heard)) = watch.heard.await else {
                 debug!(network = %network, "could not tell which message was ours");
                 return;
             };
@@ -868,7 +860,6 @@ impl Router {
                     }
                     if let Some(watch) = sent.relays {
                         self.count_relays(
-                            Arc::clone(backend),
                             watch,
                             &message.room_id,
                             &message.event_id,
@@ -1104,6 +1095,7 @@ mod tests {
             text: &str,
             reply_to: Option<MessageRef>,
         ) -> Result<Broadcast> {
+            let relays = *self.relays.lock().await;
             let mut sent = self.sent.lock().await;
             sent.push((channel, text.to_owned(), reply_to));
             let reference = match self.kind {
@@ -1119,17 +1111,14 @@ mod tests {
             Ok(Broadcast {
                 reference,
                 // As the real backends: only MeshCore can overhear repeaters.
-                relays: (self.kind == MeshKind::MeshCore).then(|| RelayWatch {
-                    id: 0,
-                    // Short, because a test that waits out a real watch is a
-                    // test nobody runs.
-                    within: Duration::from_millis(20),
+                // Answered at once, since the waiting is the real backend's and
+                // a test that waits out a real watch is a test nobody runs.
+                relays: (self.kind == MeshKind::MeshCore).then(|| {
+                    let (answer, heard) = oneshot::channel();
+                    let _ = answer.send(relays);
+                    RelayWatch { heard }
                 }),
             })
-        }
-
-        async fn relays_heard(&self, _watch: &RelayWatch) -> Option<usize> {
-            *self.relays.lock().await
         }
 
         async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<Delivery> {

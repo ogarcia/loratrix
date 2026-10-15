@@ -3,6 +3,13 @@
 # or fails clippy. `cargo test` is intentionally NOT run here —
 # tests are CI's job; the hook keeps the local feedback loop fast.
 #
+# Clippy runs over all three feature combinations, not just the full
+# one, because the interesting warnings are the ones that only appear
+# without a backend: a field or method read by meshcore alone is dead
+# code in a meshtastic-only build, and the full build cannot see it.
+# Three checks against a warm cache cost seconds; the round trip
+# through CI to learn the same thing costs minutes.
+#
 # Activate once per clone:
 #   git config core.hooksPath .githooks
 
@@ -14,8 +21,23 @@ if ! cargo fmt --all -- --check; then
     exit 1
 fi
 
-if ! cargo clippy --workspace --all-targets --all-features -- -D warnings; then
+clippy() {
+    cargo clippy --workspace --all-targets "$@" -- -D warnings
+}
+
+if ! clippy --all-features; then
     echo
     echo "✗ clippy reported warnings. Fix them before committing." >&2
     exit 1
 fi
+
+for features in meshtastic meshcore; do
+    if ! clippy --no-default-features --features "$features"; then
+        echo
+        echo "✗ clippy reported warnings with only '$features' enabled." >&2
+        echo "  Reproduce with:" >&2
+        echo "  cargo clippy --workspace --all-targets \\" >&2
+        echo "    --no-default-features --features $features -- -D warnings" >&2
+        exit 1
+    fi
+done

@@ -157,14 +157,20 @@ pub struct Broadcast {
 /// transmits it again, and a radio in earshot hears that.
 ///
 /// Which makes this an observation rather than a confirmation, and it is
-/// reported as one. Ask [`MeshBackend::relays_heard`] once `within` has passed.
+/// reported as one. The backend listens for as long as it judges useful and
+/// then answers; there is nothing to poll and no deadline to keep here.
 #[derive(Debug)]
 pub struct RelayWatch {
-    /// Identifies this broadcast to the backend watching for it.
-    pub id: u64,
-    /// How long to listen before deciding. A repeater takes a second or two to
-    /// pass a message on, and anything arriving long after is somebody else's.
-    pub within: Duration,
+    /// How many repeaters were heard carrying the message.
+    ///
+    /// [`None`] means no answer rather than none heard: the backend could not
+    /// tell our message apart from other traffic on the air, and saying "nobody
+    /// repeated it" would be a different claim entirely. `Some(0)` is that
+    /// claim, and an honest one.
+    ///
+    /// A dropped sender — the link went down mid-watch — reads the same as no
+    /// answer, which is what it is.
+    pub heard: oneshot::Receiver<Option<usize>>,
 }
 
 /// Where a received message came from.
@@ -284,18 +290,6 @@ pub trait MeshBackend: Send + Sync {
         text: &str,
         reply_to: Option<MessageRef>,
     ) -> Result<Broadcast>;
-
-    /// How many repeaters were heard carrying a broadcast, once its watch has
-    /// run its course.
-    ///
-    /// [`None`] means no answer rather than none heard: the backend could not
-    /// tell our message apart from other traffic on the air, and saying "nobody
-    /// repeated it" would be a different claim entirely. `Some(0)` is that
-    /// claim, and an honest one.
-    async fn relays_heard(&self, watch: &RelayWatch) -> Option<usize> {
-        let _ = watch;
-        None
-    }
 
     /// Send a direct message to a peer.
     ///

@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex as SyncMutex, RwLock as SyncRwLock};
 use std::time::Duration;
@@ -114,6 +115,50 @@ fn split_sender(text: &str) -> Option<(&str, &str)> {
     Some((name, body))
 }
 
+/// What a watch heard, and whether it can be believed.
+///
+/// One message repeated while the watch was open is taken to be ours. Two means
+/// the air was busy and either could have been, which is reported as no answer
+/// rather than as a guess; see [`RelayWatch::heard`].
+fn verdict(
+    watching: &SyncMutex<HashMap<u64, RelayEchoes>>,
+    id: u64,
+    network: &str,
+) -> Option<usize> {
+    let echoes = match watching.lock() {
+        Ok(mut watching) => watching.remove(&id)?,
+        Err(_) => {
+            warn!(network = %network, "the relay watch lock is poisoned");
+            return None;
+        }
+    };
+
+    if echoes.overlapped {
+        debug!(
+            network = %network,
+            "another broadcast shared the air; cannot tell which echo was ours"
+        );
+        return None;
+    }
+
+    match echoes.heard.len() {
+        0 => Some(0),
+        1 => echoes
+            .heard
+            .into_values()
+            .next()
+            .map(|carried| carried.len()),
+        several => {
+            debug!(
+                network = %network,
+                messages = several,
+                "several messages were repeated at once; cannot tell which was ours"
+            );
+            None
+        }
+    }
+}
+
 /// The repeaters a packet has been through, as the hashes each one appended.
 ///
 /// Written apart rather than as one run of hex, because the boundaries are the
@@ -194,7 +239,8 @@ pub struct MeshCoreBackend {
     /// expect. The acknowledgement arrives later, as an event of its own.
     awaiting_ack: SyncMutex<HashMap<[u8; 4], oneshot::Sender<bool>>>,
     /// Broadcasts whose repeaters we are still listening for, by watch id.
-    watching: SyncMutex<HashMap<u64, RelayEchoes>>,
+    /// Shared with the task that closes each watch when its time is up.
+    watching: Arc<SyncMutex<HashMap<u64, RelayEchoes>>>,
     /// Hands out those ids. Only has to be unique among the open watches.
     next_watch: AtomicU64,
 }
@@ -235,7 +281,7 @@ impl MeshCoreBackend {
             next_send: Mutex::new(None),
             names_read_at: Mutex::new(None),
             awaiting_ack: SyncMutex::new(HashMap::new()),
-            watching: SyncMutex::new(HashMap::new()),
+            watching: Arc::new(SyncMutex::new(HashMap::new())),
             next_watch: AtomicU64::new(0),
         })
     }
@@ -494,7 +540,12 @@ impl MeshCoreBackend {
         }
     }
 
-    /// Start listening for repeaters carrying what is about to go out.
+    /// Start listening for repeaters carrying what is about to go out, and
+    /// answer once the listening is done.
+    ///
+    /// The waiting happens here rather than at the caller because the deadline
+    /// is this protocol's business: how long a repeater takes to pass a message
+    /// on is a fact about MeshCore, and nothing outside needs to hold it.
     fn watch_relays(&self) -> RelayWatch {
         let id = self.next_watch.fetch_add(1, Ordering::Relaxed);
         match self.watching.lock() {
@@ -516,10 +567,17 @@ impl MeshCoreBackend {
             }
             Err(_) => warn!(network = %self.id, "the relay watch lock is poisoned"),
         }
-        RelayWatch {
-            id,
-            within: RELAY_WATCH,
-        }
+
+        let (answer, heard) = oneshot::channel();
+        let watching = Arc::clone(&self.watching);
+        let network = self.id.clone();
+        tokio::spawn(async move {
+            sleep(RELAY_WATCH).await;
+            // Nobody left to tell is not a problem: the caller gave up, and the
+            // entry is removed either way.
+            let _ = answer.send(verdict(&watching, id, &network));
+        });
+        RelayWatch { heard }
     }
 
     /// Resolve a sender prefix to an advertised name.
@@ -748,45 +806,6 @@ impl MeshBackend for MeshCoreBackend {
         })
     }
 
-    /// What the watch heard, and whether it can be believed.
-    ///
-    /// One message repeated during the window is taken to be ours. Two means
-    /// the air was busy and either could have been, which is reported as no
-    /// answer rather than as a guess — see [`MeshBackend::relays_heard`].
-    async fn relays_heard(&self, watch: &RelayWatch) -> Option<usize> {
-        let echoes = match self.watching.lock() {
-            Ok(mut watching) => watching.remove(&watch.id)?,
-            Err(_) => {
-                warn!(network = %self.id, "the relay watch lock is poisoned");
-                return None;
-            }
-        };
-
-        if echoes.overlapped {
-            debug!(
-                network = %self.id,
-                "another broadcast shared the air; cannot tell which echo was ours"
-            );
-            return None;
-        }
-
-        match echoes.heard.len() {
-            0 => Some(0),
-            1 => {
-                let carried = echoes.heard.into_values().next()?;
-                Some(carried.len())
-            }
-            several => {
-                debug!(
-                    network = %self.id,
-                    messages = several,
-                    "several messages were repeated at once; cannot tell which was ours"
-                );
-                None
-            }
-        }
-    }
-
     fn resolve_name(&self, peer: &PeerId) -> Option<String> {
         let PeerId::KeyPrefix(prefix) = peer else {
             return None;
@@ -897,10 +916,23 @@ mod tests {
         }
     }
 
+    /// What a watch answers, with the clock wound forward so the listening
+    /// window does not have to be waited out.
+    async fn heard(watch: RelayWatch) -> Option<usize> {
+        watch.heard.await.expect("the watch always answers")
+    }
+
+    /// Wind the clock forward so a listening window does not have to be waited
+    /// out. Once per test: freezing an already frozen clock is an error.
+    fn no_waiting() {
+        tokio::time::pause();
+    }
+
     /// The whole point: our message comes back carried by a repeater, and that
     /// repeater is what the watch counts.
     #[tokio::test]
     async fn a_repeated_broadcast_counts_its_repeaters() {
+        no_waiting();
         let backend = offline();
         let watch = backend.watch_relays();
 
@@ -908,59 +940,64 @@ mod tests {
         backend.log_rf(&overheard(b"encrypted", &[&[0x1e, 0x35]], 2));
         backend.log_rf(&overheard(b"encrypted", &[&[0xa3, 0x01]], 2));
 
-        assert_eq!(backend.relays_heard(&watch).await, Some(2));
+        assert_eq!(heard(watch).await, Some(2));
     }
 
     /// One repeater heard twice is still one repeater.
     #[tokio::test]
     async fn the_same_repeater_twice_is_counted_once() {
+        no_waiting();
         let backend = offline();
         let watch = backend.watch_relays();
 
         backend.log_rf(&overheard(b"encrypted", &[&[0x1e, 0x35]], 2));
         backend.log_rf(&overheard(b"encrypted", &[&[0x1e, 0x35]], 2));
 
-        assert_eq!(backend.relays_heard(&watch).await, Some(1));
+        assert_eq!(heard(watch).await, Some(1));
     }
 
     /// Nothing repeated it, which is a count rather than an absence of one.
     #[tokio::test]
     async fn a_broadcast_nobody_carried_is_zero_not_unknown() {
+        no_waiting();
         let backend = offline();
         let watch = backend.watch_relays();
 
-        assert_eq!(backend.relays_heard(&watch).await, Some(0));
+        assert_eq!(heard(watch).await, Some(0));
     }
 
     /// Two messages being repeated at once, and no way to tell which was ours.
     /// Reported as no answer rather than as a number picked between them.
     #[tokio::test]
     async fn two_messages_at_once_cannot_be_told_apart() {
+        no_waiting();
         let backend = offline();
         let watch = backend.watch_relays();
 
         backend.log_rf(&overheard(b"ours, probably", &[&[0x1e, 0x35]], 2));
         backend.log_rf(&overheard(b"somebody else's", &[&[0xa3, 0x01]], 2));
 
-        assert_eq!(backend.relays_heard(&watch).await, None);
+        assert_eq!(heard(watch).await, None);
     }
 
     /// A packet straight from its sender has been through no repeater, so it
     /// says nothing about ours having travelled.
     #[tokio::test]
     async fn a_packet_that_was_never_repeated_is_not_an_echo() {
+        no_waiting();
         let backend = offline();
         let watch = backend.watch_relays();
 
         backend.log_rf(&overheard(b"straight from the sender", &[], 1));
 
-        assert_eq!(backend.relays_heard(&watch).await, Some(0));
+        assert_eq!(heard(watch).await, Some(0));
     }
 
     /// Only channel messages can be ours; a repeated advert is somebody saying
     /// who they are.
     #[tokio::test]
     async fn other_traffic_is_not_mistaken_for_our_message() {
+        no_waiting();
         let backend = offline();
         let watch = backend.watch_relays();
 
@@ -970,7 +1007,7 @@ mod tests {
         }
         backend.log_rf(&advert);
 
-        assert_eq!(backend.relays_heard(&watch).await, Some(0));
+        assert_eq!(heard(watch).await, Some(0));
     }
 
     /// Two broadcasts in flight at once: an echo arriving then belongs to
@@ -978,6 +1015,7 @@ mod tests {
     /// messages claiming the same repeater.
     #[tokio::test]
     async fn overlapping_watches_do_not_claim_each_other_echoes() {
+        no_waiting();
         let backend = offline();
         let first = backend.watch_relays();
         backend.log_rf(&overheard(b"the first", &[&[0x1e, 0x35]], 2));
@@ -986,21 +1024,32 @@ mod tests {
         backend.log_rf(&overheard(b"the second", &[&[0xa3, 0x01]], 2));
 
         assert_eq!(
-            backend.relays_heard(&first).await,
+            heard(first).await,
             None,
             "the first watch saw both and cannot choose"
         );
-        assert_eq!(backend.relays_heard(&second).await, None);
+        assert_eq!(heard(second).await, None);
     }
 
-    /// Asking twice is asking about a watch that is over.
+    /// A watch that has answered leaves nothing behind. Reading it twice is not
+    /// expressible — the answer is taken by value — so what is left to check is
+    /// that the backend is not accumulating them.
     #[tokio::test]
-    async fn a_watch_is_spent_once_it_is_read() {
+    async fn a_watch_that_has_answered_is_forgotten() {
+        no_waiting();
         let backend = offline();
         let watch = backend.watch_relays();
+        assert_eq!(
+            backend.watching.lock().expect("a fresh lock").len(),
+            1,
+            "open while it listens"
+        );
 
-        assert_eq!(backend.relays_heard(&watch).await, Some(0));
-        assert_eq!(backend.relays_heard(&watch).await, None);
+        assert_eq!(heard(watch).await, Some(0));
+        assert!(
+            backend.watching.lock().expect("a fresh lock").is_empty(),
+            "and gone once it has answered"
+        );
     }
 
     #[test]
