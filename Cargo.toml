@@ -46,8 +46,11 @@ reqwest = { version = "0.13", default-features = false, features = [
   # /sync carries its filter and stream position as query parameters, and
   # hand-rolling that encoding is exactly the sort of thing to get wrong once.
   "query",
+  # Which brings rustls-platform-verifier, so the operating system's trust
+  # store is used and a homeserver behind an internal CA works without extra
+  # configuration. reqwest 0.13 dropped the roots features that used to say so
+  # explicitly; this is now the default and there is nothing to ask for.
   "rustls",
-  "rustls-native-certs",
 ] }
 # One error type for the whole binary. thiserror is not pulled in until we
 # actually need callers to match on error variants.
@@ -68,7 +71,7 @@ async-trait = "0.1"
 # which would drag btleplug and libdbus-sys into every build and break a static
 # musl one, so its features are named explicitly and BLE is left to ours.
 meshtastic = { version = "0.1", optional = true }
-meshcore-rs = { version = "0.1", optional = true, default-features = false, features = [
+meshcore-rs = { version = "0.2", optional = true, default-features = false, features = [
   "serial",
   "tcp",
 ] }
