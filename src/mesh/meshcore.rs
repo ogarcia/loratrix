@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use meshcore_rs::events::{LogData, MeshPacketHeader};
+use meshcore_rs::events::{LogData, MeshPacketHeader, SelfInfo};
 use meshcore_rs::{EventPayload, EventType, MeshCore};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use tokio::time::{Instant, sleep, sleep_until};
@@ -59,6 +59,18 @@ const NAME_REFRESH_COOLDOWN: Duration = Duration::from_secs(60);
 /// was heard. A repeater passes a message on within a second or two; well past
 /// that and what arrives is somebody else's traffic.
 const RELAY_WATCH: Duration = Duration::from_secs(12);
+
+/// The `APP_START` command, which opens a companion session.
+const CMD_APP_START: u8 = 0x01;
+
+/// What the radio is told it is talking to.
+///
+/// `meshcore-rs` says `mccli` — the name of the Python command-line client the
+/// crate was modelled on — and gives no way to change it, which is why the
+/// frame is built here instead of calling `send_appstart`. The firmware only
+/// prints the name ("App %s connected"), and that is exactly the place where it
+/// should say who is really connected.
+const APP_NAME: &[u8] = b"loratrix";
 
 /// A broadcast of ours, and the echoes heard while its watch is open.
 ///
@@ -189,6 +201,37 @@ fn fingerprint_key(payload: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// The `APP_START` frame: one command byte, seven reserved bytes the firmware
+/// ignores, and then the name of whatever is connecting.
+fn appstart_frame() -> Vec<u8> {
+    let mut frame = vec![0u8; 8];
+    frame[0] = CMD_APP_START;
+    frame.extend_from_slice(APP_NAME);
+    frame
+}
+
+/// Open a companion session, which is what `APP_START` is for: the radio
+/// answers it with its own identity and radio settings.
+///
+/// See [`APP_NAME`] for why the frame is assembled here rather than asked of
+/// the crate.
+async fn appstart(client: &MeshCore) -> Result<SelfInfo> {
+    let frame = appstart_frame();
+
+    let event = client
+        .commands()
+        .lock()
+        .await
+        .send(&frame, Some(EventType::SelfInfo))
+        .await
+        .context("sending appstart")?;
+
+    match event.payload {
+        EventPayload::SelfInfo(info) => Ok(info),
+        other => bail!("the radio answered APP_START with {other:?}"),
+    }
+}
+
 /// Where the companion radio is and how to reach it.
 #[derive(Clone, Debug)]
 enum Link {
@@ -309,13 +352,7 @@ impl MeshCoreBackend {
         // events like any other.
         let mut events = client.dispatcher().receiver();
 
-        let info = client
-            .commands()
-            .lock()
-            .await
-            .send_appstart()
-            .await
-            .context("sending appstart")?;
+        let info = appstart(&client).await?;
         info!(network = %self.id, link = %self.link, device = %info.name, "connected");
 
         self.load_names(&client).await;
@@ -828,6 +865,17 @@ mod tests {
 
     fn backend(transport: Transport) -> MeshCoreBackend {
         MeshCoreBackend::new(&network(transport)).expect("valid transport")
+    }
+
+    /// The radio logs the name of whatever connects to it, and what it should
+    /// log is us rather than the crate's borrowed `mccli`.
+    #[test]
+    fn the_handshake_names_this_relay() {
+        let frame = appstart_frame();
+
+        assert_eq!(frame[0], 0x01, "APP_START");
+        assert_eq!(&frame[1..8], &[0; 7], "reserved");
+        assert_eq!(&frame[8..], b"loratrix");
     }
 
     /// The repeater hashes are what say how far a packet has travelled, so the
