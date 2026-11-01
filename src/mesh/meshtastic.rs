@@ -385,6 +385,9 @@ impl MeshtasticBackend {
             // What a reply to this would have to name. Zero is the firmware's
             // "unset", and a packet without an id is one nothing can point at.
             reference: (packet.id != 0).then_some(MessageRef::Packet(packet.id)),
+            // And a reaction names the same thing: this protocol gives a packet
+            // one id and everything points at it.
+            reaction_ref: (packet.id != 0).then_some(MessageRef::Packet(packet.id)),
             // A tapback: the payload is an emoji and `reply_id` says what it is
             // about. Without the flag this is somebody typing a thumbs-up, which
             // is an ordinary message and stays one.
@@ -705,7 +708,10 @@ impl MeshBackend for MeshtasticBackend {
             .transmit(BROADCAST_ADDR, channel, text, reply_to, false)
             .await?;
         Ok(Broadcast {
-            reference: Some(reference),
+            reference: Some(reference.clone()),
+            reaction_ref: Some(reference),
+            // Meshtastic radios do not report what they overhear, so there is
+            // no way to tell who carried this.
             relays: None,
         })
     }
@@ -720,7 +726,6 @@ impl MeshBackend for MeshtasticBackend {
         let MessageRef::Packet(id) = sent else {
             unreachable!("this backend only ever sends packets");
         };
-        let reference = Some(sent.clone());
 
         // Registered after the send rather than before, because an acknowledgement
         // cannot arrive for a packet the radio was never given, and a send that
@@ -733,7 +738,7 @@ impl MeshBackend for MeshtasticBackend {
             Err(_) => warn!(network = %self.id, "the pending-ack lock is poisoned"),
         }
         Ok(Delivery {
-            reference,
+            reaction_ref: Some(sent),
             ack,
             within: ACK_TIMEOUT,
         })

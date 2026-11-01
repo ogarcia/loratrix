@@ -31,7 +31,7 @@ arriving back and being parsed, and 80 real Matrix events read.
 - Duplicate and echo suppression, so bridged meshes do not loop.
 - Replies: answering a message in Matrix reaches the mesh as a reply to that
   message, in whichever way the protocol there expresses one.
-- Reactions from Meshtastic reach Matrix, as a reaction where that says the
+- Reactions reach Matrix from both meshes, as a reaction where that says the
   truth and as an emote where it would not.
 - On MeshCore, a broadcast is marked with the repeaters overheard carrying it,
   which is the nearest thing that protocol has to a delivery report.
@@ -291,8 +291,26 @@ message was meant for.
 ### Reactions, and why they are not always reactions
 
 Meshtastic has tapbacks: a thumbs-up on a message is an ordinary text packet
-with `emoji` set and `reply_id` naming what it is about. MeshCore has nothing of
-the kind, so all of this is Meshtastic only.
+with `emoji` set and `reply_id` naming what it is about.
+
+MeshCore has no such thing in the protocol, and its clients do what they already
+do for the sender's name and for replies — put it in the text:
+
+```text
+@[ALICE]😂
+tdrfsa84
+```
+
+the person who wrote the message, the emoji, and a fingerprint of the message
+itself: the first forty bits of `SHA-256(text ‖ timestamp)` in Crockford's
+base32. Everybody on the channel has the text and the timestamp, so everybody
+computes the same eight characters, which is what lets a reaction name one
+message rather than a person. Within a direct message the marker is dropped and
+the emoji and the fingerprint travel alone.
+
+That is the convention of **MeshCore One**, the Apple client. Others exist —
+`meshcore-open` sends an index into an emoji table of its own — and are read as
+the plain text they are until one turns up on the air here.
 
 Relaying one **as** a Matrix reaction is only honest in a direct message. A
 reaction there is identified by who sent it, what it is on and what it says, and
@@ -313,9 +331,11 @@ So it depends on where:
   and nothing is lost. That includes reacting to an answer *you* wrote from
   Matrix.
 
-A reaction to something the relay no longer remembers is dropped: a bare emoji
-with nothing to attach it to says less than nothing. Reactions are not fanned
-out to other meshes either — spending LoRa airtime on a thumbs-up is not worth
+A reaction to something the relay no longer remembers — older than the window,
+or from before it started — is relayed as `Bob reacted 👍 to an earlier message`.
+Which message cannot be said, but that somebody reacted can, and a room that
+shows nothing at all makes the mesh look quieter than it is. Reactions are not
+fanned out to other meshes — spending LoRa airtime on a thumbs-up is not worth
 it, and the convention does not exist on the other side.
 
 One consequence worth knowing: duplicate suppression keys a reaction on what it

@@ -102,6 +102,9 @@ pub enum MessageRef {
     /// The name a MeshCore client wrote into the text, which is all a reply
     /// there has to point at.
     Author(String),
+    /// A fingerprint of a MeshCore message, which is how a reaction there names
+    /// what it is about. Eight characters; see `meshcore::mc1`.
+    Digest(String),
 }
 
 impl fmt::Display for MessageRef {
@@ -109,6 +112,7 @@ impl fmt::Display for MessageRef {
         match self {
             MessageRef::Packet(id) => write!(f, "{id:08x}"),
             MessageRef::Author(name) => f.write_str(name),
+            MessageRef::Digest(hash) => f.write_str(hash),
         }
     }
 }
@@ -122,9 +126,13 @@ impl fmt::Display for MessageRef {
 /// to wait for rather than what happened.
 #[derive(Debug)]
 pub struct Delivery {
-    /// What the message went out as, so a reaction to it can be recognized when
-    /// it comes back. `None` on a protocol with nothing to name.
-    pub reference: Option<MessageRef>,
+    /// What a reaction to the message would name, so one arriving later can be
+    /// put on the message that caused it. See [`IncomingMesh::reaction_ref`].
+    ///
+    /// There is no reply reference beside it: a direct message is a
+    /// conversation of two, and nothing in either protocol expresses a reply
+    /// within one.
+    pub reaction_ref: Option<MessageRef>,
     /// `true` once the far node has acknowledged. `false` if the mesh said
     /// outright that it could not be delivered, which is worth knowing early
     /// rather than waiting out the timeout for.
@@ -144,6 +152,9 @@ pub struct Delivery {
 pub struct Broadcast {
     /// What a reply to this message has to name, as [`MessageRef`] explains.
     pub reference: Option<MessageRef>,
+    /// What a reaction to it has to name, which on MeshCore is something else
+    /// again. See [`IncomingMesh::reaction_ref`].
+    pub reaction_ref: Option<MessageRef>,
     /// Where the protocol allows it to be observed, a way of finding out which
     /// repeaters carried it. [`None`] where it cannot be.
     pub relays: Option<RelayWatch>,
@@ -221,6 +232,15 @@ pub struct IncomingMesh {
     /// nothing to name it by, which on MeshCore is any message whose sender we
     /// could not recover from the text.
     pub reference: Option<MessageRef>,
+    /// What a *reaction* to this message would have to name, which is not
+    /// always the same thing.
+    ///
+    /// On Meshtastic it is: both point at the packet. On MeshCore the two come
+    /// apart — a reply names the person who wrote the message and a reaction
+    /// names the message itself, by a fingerprint of its text and timestamp —
+    /// so the two references are kept separately rather than one standing in
+    /// for the other.
+    pub reaction_ref: Option<MessageRef>,
     /// Set when this is not a message at all but a reaction to one, naming what
     /// it is a reaction to. The text is then the emoji itself.
     ///
@@ -343,6 +363,7 @@ mod tests {
             sender: None,
             text: "hi".to_owned(),
             reference: None,
+            reaction_ref: None,
             reacts_to: None,
         };
         assert_eq!(direct.channel(), None);

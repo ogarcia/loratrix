@@ -272,22 +272,18 @@ impl Router {
         // away as a duplicate. What it is about and who sent it are what make it
         // its own reaction.
         //
-        // Naming the sender is safe here in a way it is not for messages: only
-        // Meshtastic has reactions, and a Meshtastic packet always says who it is
-        // from. A duplicate of the same reaction — the same node reaching us
-        // twice, over LoRa and over MQTT — still collapses, which is the point.
+        // Naming the sender is what keeps them apart, by whatever the protocol
+        // gave: an address on Meshtastic, and on MeshCore the name the client
+        // wrote into the text, which is all there is. A duplicate of the same
+        // reaction — the same node reaching us twice, over LoRa and over MQTT —
+        // still collapses, which is the point.
         let key = match &message.reacts_to {
             Some(about) => message_key(
                 &message.network,
                 message.channel(),
                 &format!(
                     "{about}\u{0}{}\u{0}{}",
-                    message
-                        .sender
-                        .as_ref()
-                        .and_then(|sender| sender.id.as_ref())
-                        .map(ToString::to_string)
-                        .unwrap_or_default(),
+                    self.reactor(&message),
                     message.text
                 ),
             ),
@@ -343,15 +339,32 @@ impl Router {
             .lock()
             .await
             .posted_in(&message.network, about, &rooms, now);
+        let names = self.names_of(message.sender.as_ref());
         if seen.is_empty() {
-            debug!(
-                network = %message.network,
-                "a reaction to a message we no longer know, dropping"
+            // Said plainly rather than dropped: somebody did react, and a room
+            // that shows nothing at all is a room where the mesh looks quieter
+            // than it is. What cannot be said is to *what* — the message is
+            // older than we are, or older than the window.
+            let body = format!(
+                "{} reacted {} to an earlier message",
+                names.name, message.text
             );
+            for room in &rooms {
+                match self.matrix.send(room, &body, MsgKind::Emote).await {
+                    Ok(_) => info!(
+                        network = %message.network,
+                        room = %room,
+                        sender = %names.name,
+                        "reaction -> matrix, unplaced"
+                    ),
+                    Err(error) => {
+                        warn!(room = %room, %error, "failed to relay a reaction")
+                    }
+                }
+            }
             return;
         }
 
-        let names = self.names_of(message.sender.as_ref());
         for posted in seen {
             let result = match message.origin {
                 // One conversation, one possible reactor.
@@ -440,14 +453,17 @@ impl Router {
                 // Now the two names for this one message are both known, so an
                 // answer written in Matrix can point back at what the mesh calls
                 // it.
+                let mut replies = self.replies.lock().await;
                 if let Some(reference) = message.reference.clone() {
-                    let mut replies = self.replies.lock().await;
-                    replies.remember(&event, &message.network, reference.clone(), now);
-                    // And the other way round, so a reaction arriving later can
-                    // be put on this message and quote it.
+                    replies.remember(&event, &message.network, reference, now);
+                }
+                // And the other way round, so a reaction arriving later can be
+                // put on this message and quote it. Keyed by what a *reaction*
+                // names, which is not always what a reply names.
+                if let Some(reference) = message.reaction_ref.as_ref() {
                     replies.remember_posted(
                         &message.network,
-                        &reference,
+                        reference,
                         Posted {
                             room: room.to_owned(),
                             event: event.clone(),
@@ -456,6 +472,7 @@ impl Router {
                         now,
                     );
                 }
+                drop(replies);
                 Some(event)
             }
             Err(error) => {
@@ -585,10 +602,10 @@ impl Router {
                     // event is a reply to this person, on this network.
                     let mut replies = self.replies.lock().await;
                     replies.remember_correspondent(&event, &message.network, peer, now);
-                    if let Some(reference) = message.reference.clone() {
+                    if let Some(reference) = message.reaction_ref.as_ref() {
                         replies.remember_posted(
                             &message.network,
-                            &reference,
+                            reference,
                             Posted {
                                 room: target.room.clone(),
                                 event,
@@ -660,12 +677,12 @@ impl Router {
                     bytes = payload.len(),
                     "matrix -> direct message"
                 );
-                if let Some(reference) = delivery.reference.clone() {
+                if let Some(reference) = delivery.reaction_ref.as_ref() {
                     // What we just said is also something the far node may react
                     // to, and its reaction belongs on the message written here.
                     self.replies.lock().await.remember_posted(
                         &network,
-                        &reference,
+                        reference,
                         Posted {
                             room: message.room_id.clone(),
                             event: message.event_id.clone(),
@@ -849,15 +866,26 @@ impl Router {
                         "matrix -> mesh"
                     );
                     // And this message becomes something that can be replied to
-                    // in turn.
+                    // in turn, and reacted to.
+                    let mut replies = self.replies.lock().await;
                     if let Some(reference) = sent.reference.clone() {
-                        self.replies.lock().await.remember(
-                            &message.event_id,
+                        replies.remember(&message.event_id, &route.network, reference, now);
+                    }
+                    if let Some(reference) = sent.reaction_ref.as_ref() {
+                        replies.remember_posted(
                             &route.network,
                             reference,
+                            Posted {
+                                room: message.room_id.clone(),
+                                event: message.event_id.clone(),
+                                // Written in the room to begin with, so quoting
+                                // it back repeats nothing.
+                                excerpt: Some(excerpt(&body)),
+                            },
                             now,
                         );
                     }
+                    drop(replies);
                     if let Some(watch) = sent.relays {
                         self.count_relays(
                             watch,
@@ -875,6 +903,25 @@ impl Router {
                 ),
             }
         }
+    }
+
+    /// Who sent a reaction, by whatever the protocol gives: an address where
+    /// there is one, and otherwise the name the client wrote into the text.
+    ///
+    /// Only used to tell two reactions apart, so an empty answer costs a
+    /// duplicate rather than a wrong attribution.
+    fn reactor(&self, message: &IncomingMesh) -> String {
+        message
+            .sender
+            .as_ref()
+            .and_then(|sender| {
+                sender
+                    .id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .or_else(|| sender.display_name().map(str::to_owned))
+            })
+            .unwrap_or_default()
     }
 
     /// Pick apart what a sender gave us into the three name placeholders.
@@ -1109,6 +1156,9 @@ mod tests {
                     .map(|(name, _)| MessageRef::Author(name.to_owned())),
             };
             Ok(Broadcast {
+                // In a test the two are the same thing: what matters is that
+                // the router indexes by one and replies by the other.
+                reaction_ref: reference.clone(),
                 reference,
                 // As the real backends: only MeshCore can overhear repeaters.
                 // Answered at once, since the waiting is the real backend's and
@@ -1130,7 +1180,7 @@ mod tests {
             // Short, because a test that waits out a real mesh timeout is a test
             // nobody runs.
             Ok(Delivery {
-                reference: (self.kind == MeshKind::Meshtastic)
+                reaction_ref: (self.kind == MeshKind::Meshtastic)
                     .then(|| MessageRef::Packet(DM_PACKET)),
                 ack,
                 within: Duration::from_millis(50),
@@ -1312,6 +1362,7 @@ mod tests {
             }),
             text: text.to_owned(),
             reference: Some(mesh_packet()),
+            reaction_ref: Some(mesh_packet()),
             reacts_to: None,
         }
     }
@@ -1455,6 +1506,7 @@ mod tests {
                     }),
                     text: "hola".to_owned(),
                     reference: Some(mesh_packet()),
+                    reaction_ref: Some(mesh_packet()),
                     reacts_to: None,
                 },
                 Instant::now(),
@@ -1474,6 +1526,7 @@ mod tests {
                     }),
                     text: "bos dias".to_owned(),
                     reference: Some(MessageRef::Author("EA1HYZ".to_owned())),
+                    reaction_ref: Some(MessageRef::Digest("b45pc4ek".to_owned())),
                     reacts_to: None,
                 },
                 Instant::now(),
@@ -1548,6 +1601,7 @@ mod tests {
                     }),
                     text: "Hi".to_owned(),
                     reference: Some(mesh_packet()),
+                    reaction_ref: Some(mesh_packet()),
                     reacts_to: None,
                 },
                 Instant::now(),
@@ -1581,6 +1635,7 @@ mod tests {
                     }),
                     text: "Hi".to_owned(),
                     reference: Some(mesh_packet()),
+                    reaction_ref: Some(mesh_packet()),
                     reacts_to: None,
                 },
                 Instant::now(),
@@ -1936,8 +1991,16 @@ mod tests {
                 short_name: None,
             }),
             text: text.to_owned(),
-            // Meshtastic packets carry an id; MeshCore direct messages do not.
-            reference: (network == "lora").then(mesh_packet),
+            // Nothing in a direct message to reply to by name, on either
+            // protocol.
+            reference: None,
+            // Both can be reacted to, by the packet id on one and by the
+            // fingerprint of the text on the other.
+            reaction_ref: Some(if network == "lora" {
+                mesh_packet()
+            } else {
+                MessageRef::Digest("b45pc4ek".to_owned())
+            }),
             reacts_to: None,
         }
     }
@@ -2143,10 +2206,45 @@ mod tests {
         );
     }
 
-    /// Older than the window, or from before a restart: there is nothing to
-    /// attach it to, and a bare emoji in the room would say nothing.
+    /// The MeshCore half, end to end: a message is indexed by its fingerprint
+    /// and the reaction naming that fingerprint lands on it.
+    ///
+    /// Worth its own test because on this protocol a reply and a reaction name
+    /// different things — the person and the message — and it is the second
+    /// that has to be remembered for this to work.
     #[tokio::test]
-    async fn a_reaction_to_something_forgotten_is_dropped() {
+    async fn a_meshcore_reaction_lands_on_the_message_it_names() {
+        let h = harness(MESHCORE_ROOM);
+        let fingerprint = MessageRef::Digest("tdrfsa84".to_owned());
+        let now = Instant::now();
+
+        let said = IncomingMesh {
+            reference: Some(MessageRef::Author("ALICE".to_owned())),
+            reaction_ref: Some(fingerprint.clone()),
+            ..from_mesh("mc", 0, Some("ALICE"), "hola a todos")
+        };
+        h.router.handle_mesh(said, now).await;
+
+        h.router
+            .handle_mesh(
+                reacting(from_mesh("mc", 0, Some("BOB"), ""), fingerprint, "😂"),
+                now,
+            )
+            .await;
+
+        assert_eq!(
+            h.sink.emotes().await,
+            ["BOB reacted 😂 to \"hola a todos\"".to_owned()],
+            "named, and quoting what it was about"
+        );
+    }
+
+    /// Older than the window, or from before a restart. There is nothing to
+    /// attach it to, which is worth saying rather than swallowing: somebody did
+    /// react, and a room that shows nothing makes the mesh look quieter than it
+    /// is.
+    #[tokio::test]
+    async fn a_reaction_to_something_forgotten_is_still_mentioned() {
         let h = harness(ONE_ROOM);
         h.router
             .handle_mesh(
@@ -2159,8 +2257,12 @@ mod tests {
             )
             .await;
 
-        assert!(h.sink.sent().await.is_empty());
-        assert!(h.sink.emotes().await.is_empty());
+        assert_eq!(
+            h.sink.emotes().await,
+            ["Bob reacted 👍 to an earlier message".to_owned()]
+        );
+        assert_eq!(h.sink.sent().await.len(), 1, "the emote and nothing else");
+        // Nothing claiming to know which message it was about.
         assert!(h.sink.reactions().await.is_empty());
     }
 

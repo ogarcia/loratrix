@@ -9,6 +9,10 @@
 //! carry identity, as the first six bytes of the sender's public key, which is
 //! resolved against the contact list the companion radio keeps.
 //!
+//! The same convention carries what the protocol has no field for. A reply
+//! names the person being answered, `@[NAME] like this`, and a reaction names
+//! the message by a fingerprint of its text — see [`mc1`].
+//!
 //! Delivery is pull-based. The radio says `MessagesWaiting` and the host calls
 //! `get_msg` until the queue drains, which `start_auto_message_fetching` does
 //! for us. Anything queued from before we connected has to be drained by hand,
@@ -28,6 +32,8 @@ use meshcore_rs::{EventPayload, EventType, MeshCore};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use tokio::time::{Instant, sleep, sleep_until};
 use tracing::{debug, info, trace, warn};
+
+mod mc1;
 
 use crate::config::{NetworkConfig, NetworkKind, Transport};
 use crate::mesh::{
@@ -183,6 +189,17 @@ fn hops(header: &MeshPacketHeader) -> String {
         .map(|hop| hop.iter().map(|byte| format!("{byte:02x}")).collect())
         .collect::<Vec<String>>()
         .join("-")
+}
+
+/// Now, as the protocol counts it: whole seconds since the epoch.
+///
+/// Saturating rather than panicking on a clock set before 1970, which would be
+/// an odd thing for a radio to be plugged into but not a reason to stop
+/// relaying.
+fn now_secs() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as u32)
 }
 
 /// A short name for an opaque payload, so the same packet can be recognized
@@ -423,6 +440,23 @@ impl MeshCoreBackend {
                     ),
                     None => (None, message.text.clone()),
                 };
+
+                // A reaction is an ordinary message whose text follows a
+                // convention, so it is only now, with the name taken off, that
+                // one can be told from the other.
+                if let Some(reaction) = mc1::parse_channel(&text) {
+                    return Some(IncomingMesh {
+                        network: self.id.clone(),
+                        origin: Origin::Channel(message.channel_idx),
+                        sender,
+                        text: reaction.emoji,
+                        // Nothing answers or reacts to a reaction.
+                        reference: None,
+                        reaction_ref: None,
+                        reacts_to: Some(MessageRef::Digest(reaction.about)),
+                    });
+                }
+
                 Some(IncomingMesh {
                     network: self.id.clone(),
                     origin: Origin::Channel(message.channel_idx),
@@ -434,28 +468,53 @@ impl MeshCoreBackend {
                         .as_ref()
                         .and_then(|sender| sender.long_name.clone())
                         .map(MessageRef::Author),
+                    // A reaction points at the message instead, and can do so
+                    // whether or not the name came through: the fingerprint is
+                    // taken over the wire text, which is what every other client
+                    // has as well.
+                    reaction_ref: Some(MessageRef::Digest(mc1::fingerprint(
+                        mc1::body(&message.text),
+                        message.sender_timestamp,
+                    ))),
                     sender,
                     text,
-                    // MeshCore has no tapbacks. An emoji here is somebody typing
-                    // one, which is a message like any other.
                     reacts_to: None,
                 })
             }
             EventPayload::ContactMessage(message) => {
                 let prefix = message.sender_prefix;
+                let sender = Some(Sender {
+                    id: Some(PeerId::KeyPrefix(prefix)),
+                    long_name: self.name_of(&prefix).await,
+                    short_name: None,
+                });
+                // No marker here: between two people there is nobody to name,
+                // so a reaction is the emoji and the fingerprint alone.
+                let (text, reacts_to, reaction_ref) = match mc1::parse_direct(&message.text) {
+                    Some(reaction) => (
+                        reaction.emoji,
+                        Some(MessageRef::Digest(reaction.about)),
+                        None,
+                    ),
+                    None => (
+                        message.text.clone(),
+                        None,
+                        Some(MessageRef::Digest(mc1::fingerprint(
+                            &message.text,
+                            message.sender_timestamp,
+                        ))),
+                    ),
+                };
                 Some(IncomingMesh {
                     network: self.id.clone(),
                     origin: Origin::Direct(PeerId::KeyPrefix(prefix)),
-                    sender: Some(Sender {
-                        id: Some(PeerId::KeyPrefix(prefix)),
-                        long_name: self.name_of(&prefix).await,
-                        short_name: None,
-                    }),
-                    text: message.text.clone(),
+                    sender,
+                    text,
                     // A direct message is a conversation of two, where naming
                     // what you answer says nothing the address does not.
                     reference: None,
-                    reacts_to: None,
+                    reaction_ref,
+                    reacts_to,
                 })
             }
             // Every packet the radio hears, whoever it was for. Not relayed —
@@ -767,9 +826,11 @@ impl MeshBackend for MeshCoreBackend {
     fn reply_marker(&self, to: &MessageRef) -> Option<String> {
         match to {
             MessageRef::Author(name) => Some(format!("{REPLY_OPEN}{name}] ")),
-            // Not something this protocol can name. Nothing is written, and the
-            // message goes out as an ordinary one.
-            MessageRef::Packet(_) => None,
+            // Neither of these is something a reply can name: a fingerprint
+            // says which message without saying whose, and MeshCore's marker
+            // wants the person. Nothing is written and the message goes out as
+            // an ordinary one.
+            MessageRef::Packet(_) | MessageRef::Digest(_) => None,
         }
     }
 
@@ -788,13 +849,18 @@ impl MeshBackend for MeshCoreBackend {
         // Opened before the message goes out, because a repeater is quick and
         // an echo arriving before we were listening is an echo missed.
         let relays = self.watch_relays();
+        // Stamped here rather than left to the crate, because the fingerprint
+        // every other client will take of this message is over the text and
+        // this number, and one we did not see is one we cannot recognize a
+        // reaction to.
+        let stamped = now_secs();
         client
             .as_ref()
             .expect("checked just above")
             .commands()
             .lock()
             .await
-            .send_channel_msg(channel, text, None)
+            .send_channel_msg(channel, text, Some(stamped))
             .await
             .with_context(|| format!("sending on {} channel {channel}", self.id))?;
 
@@ -804,6 +870,10 @@ impl MeshBackend for MeshCoreBackend {
         // they will answer.
         Ok(Broadcast {
             reference: split_sender(text).map(|(name, _)| MessageRef::Author(name.to_owned())),
+            reaction_ref: Some(MessageRef::Digest(mc1::fingerprint(
+                mc1::body(text),
+                stamped,
+            ))),
             relays: Some(relays),
         })
     }
@@ -814,13 +884,14 @@ impl MeshBackend for MeshCoreBackend {
         };
         let client = self.connected().await?;
         self.pace().await;
+        let stamped = now_secs();
         let sent = client
             .as_ref()
             .expect("checked just above")
             .commands()
             .lock()
             .await
-            .send_msg(&prefix[..], text, None)
+            .send_msg(&prefix[..], text, Some(stamped))
             .await
             .with_context(|| format!("sending a direct message on {}", self.id))?;
 
@@ -835,9 +906,9 @@ impl MeshBackend for MeshCoreBackend {
             Err(_) => warn!(network = %self.id, "the pending-ack lock is poisoned"),
         }
         Ok(Delivery {
-            // Nothing on the wire another client could point back at, so nothing
-            // can be a reaction to it either.
-            reference: None,
+            // The same fingerprint the far end will compute from what it
+            // received, which is what a reaction to it will name.
+            reaction_ref: Some(MessageRef::Digest(mc1::fingerprint(text, stamped))),
             ack,
             within: Duration::from_millis(u64::from(sent.suggested_timeout)),
         })
@@ -1240,6 +1311,80 @@ mod tests {
                 snr: Some(9.5),
             }),
         )
+    }
+
+    /// The fingerprint everybody on the channel can compute, which is the only
+    /// thing a reaction has to point with.
+    #[tokio::test]
+    async fn a_channel_message_says_what_a_reaction_to_it_would_name() {
+        let message = offline_backend()
+            .convert(&channel_event(0, "ALICE: hola a todos"))
+            .await
+            .expect("a message");
+
+        // Over the body alone: the name the client prepended is not part of
+        // what was said, and the other clients leave it out too.
+        assert_eq!(
+            message.reaction_ref,
+            Some(MessageRef::Digest("tdrfsa84".to_owned()))
+        );
+        // A reply still names the person, as it always did.
+        assert_eq!(
+            message.reference,
+            Some(MessageRef::Author("ALICE".to_owned()))
+        );
+    }
+
+    /// Which is what arrives when somebody taps the emoji: a message like any
+    /// other, carrying a convention.
+    #[tokio::test]
+    async fn a_channel_reaction_arrives_as_a_reaction() {
+        let message = offline_backend()
+            .convert(&channel_event(0, "BOB: @[ALICE]😂\ntdrfsa84"))
+            .await
+            .expect("a reaction");
+
+        assert_eq!(message.text, "😂");
+        assert_eq!(
+            message.reacts_to,
+            Some(MessageRef::Digest("tdrfsa84".to_owned()))
+        );
+        assert_eq!(
+            message.sender.and_then(|sender| sender.long_name),
+            Some("BOB".to_owned()),
+            "the reactor is named the way any sender is"
+        );
+        // Nothing replies to a reaction, and nothing reacts to one.
+        assert_eq!(message.reference, None);
+        assert_eq!(message.reaction_ref, None);
+    }
+
+    /// Between two people there is nobody to name, so the marker goes.
+    #[tokio::test]
+    async fn a_direct_reaction_arrives_as_a_reaction() {
+        let message = offline_backend()
+            .convert(&direct_event([1, 2, 3, 4, 5, 6], "👍\nb45pc4ek"))
+            .await
+            .expect("a reaction");
+
+        assert_eq!(message.text, "👍");
+        assert_eq!(
+            message.reacts_to,
+            Some(MessageRef::Digest("b45pc4ek".to_owned()))
+        );
+    }
+
+    /// A message that merely answers somebody, which is the shape a reaction is
+    /// easiest to confuse with.
+    #[tokio::test]
+    async fn a_reply_is_not_a_reaction() {
+        let message = offline_backend()
+            .convert(&channel_event(0, "BOB: @[ALICE] hola Alice"))
+            .await
+            .expect("a message");
+
+        assert_eq!(message.reacts_to, None);
+        assert_eq!(message.text, "@[ALICE] hola Alice");
     }
 
     fn direct_event(sender_prefix: [u8; 6], text: &str) -> meshcore_rs::MeshCoreEvent {
