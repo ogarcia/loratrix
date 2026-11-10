@@ -31,13 +31,13 @@ arriving back and being parsed, and 80 real Matrix events read.
 - Duplicate and echo suppression, so bridged meshes do not loop.
 - Replies: answering a message in Matrix reaches the mesh as a reply to that
   message, in whichever way the protocol there expresses one.
-- Reactions reach Matrix from both meshes, as a reaction where that says the
-  truth and as an emote where it would not.
+- Reactions travel both ways: from either mesh into Matrix, as a reaction where
+  that says the truth and as an emote where it would not, and from Matrix back
+  out as a Meshtastic tapback or a MeshCore reaction, on the message it names.
 - On MeshCore, a broadcast is marked with the repeaters overheard carrying it,
   which is the nearest thing that protocol has to a delivery report.
 
-Deliberately out of scope: media, plugins, message history, and reactions
-written in Matrix travelling to the mesh.
+Deliberately out of scope: media, plugins and message history.
 
 End-to-end encrypted Matrix rooms are **not** supported yet. The Matrix side sits
 behind a five-method trait so an implementation backed by `matrix-sdk` can be
@@ -342,6 +342,40 @@ One consequence worth knowing: duplicate suppression keys a reaction on what it
 is about *and who sent it*, not just its text. Two people agreeing with the same
 message inside the window would otherwise look like the same message twice.
 
+#### And back the other way
+
+A reaction written in Matrix goes out as whatever that mesh calls one: a tapback
+on Meshtastic, the MC1 convention on MeshCore. It lands on the message it names
+— including on something relayed *from* Matrix, since the relay knows the
+fingerprint of what it sent — and in a DM inbox it goes back to the person whose
+message it is on, the same way an answer written there does.
+
+This direction is less forgiving than the other, and deliberately so. A mesh
+reaction that cannot be placed is still said in Matrix, where a line of text
+costs nothing. One going out is dropped instead, with the reason in the log at
+`debug`, when:
+
+- the message is older than the reply window, or from before a restart, so
+  there is nothing on the mesh to name;
+- the annotation is not an emoji — Matrix allows any short string, and `lol`
+  would reach a MeshCore channel as a line of text no client reads as a
+  reaction;
+- the message was sent on MeshCore by somebody whose name could not be
+  recovered, because the convention writes the reaction against that name;
+- or it is in a DM inbox on something that is not somebody's direct message,
+  which names nobody to send it to.
+
+Spending the payload of a real message on `alice reacted 👍` is the one thing
+not done here. A reaction either arrives as a reaction or stays in Matrix.
+
+Who reacted survives only as far as the protocol carries it. A MeshCore
+reaction is text, so it goes out behind the same prefix as any other message
+and the channel sees the name. A Meshtastic tapback carries the node number of
+whoever transmitted it, which is this relay's — so the mesh shows the relay
+reacting, the mirror image of what Matrix shows for a channel reaction coming
+the other way, and for the same reason: one account standing in for everybody
+behind it.
+
 ### Whether it arrived
 
 A direct message is the one thing here that can be confirmed, because it is the
@@ -389,8 +423,8 @@ nothing is heard beyond the first hop.
 
 ## Homeservers do not all filter
 
-The relay asks `/sync` for the bridged rooms only, messages only, and no history
-on the first request. Where that is honoured it saves a lot of traffic.
+The relay asks `/sync` for the bridged rooms only, messages and reactions only,
+and no history on the first request. Where that is honoured it saves a lot of traffic.
 
 It is not always honoured. conduwuit ignores `/sync` filters entirely, inline or
 registered alike, and answers with the last ten events of every joined room. So

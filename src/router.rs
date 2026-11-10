@@ -23,9 +23,9 @@ use tracing::{debug, info, warn};
 
 use crate::config::{Config, RelayConfig, Route};
 use crate::dedupe::{Dedupe, message_key};
-use crate::matrix::{MatrixMessage, MatrixSink, MsgKind, RoomId};
+use crate::matrix::{MatrixMessage, MatrixReaction, MatrixSink, MsgKind, RoomId};
 use crate::mesh::{
-    Delivery, IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin, PeerId,
+    Delivery, IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin, PeerId, Reaction,
     RelayWatch, Sender,
 };
 use crate::prefix::{self, Vars};
@@ -278,14 +278,12 @@ impl Router {
         // reaction — the same node reaching us twice, over LoRa and over MQTT —
         // still collapses, which is the point.
         let key = match &message.reacts_to {
-            Some(about) => message_key(
+            Some(about) => reaction_key(
                 &message.network,
                 message.channel(),
-                &format!(
-                    "{about}\u{0}{}\u{0}{}",
-                    self.reactor(&message),
-                    message.text
-                ),
+                about,
+                &self.reactor(&message),
+                &message.text,
             ),
             None => message_key(&message.network, message.channel(), &message.text),
         };
@@ -471,6 +469,9 @@ impl Router {
                         },
                         now,
                     );
+                    // And a reaction written in Matrix goes back out naming the
+                    // same thing.
+                    replies.remember_reactable(&event, &message.network, reference.clone(), now);
                 }
                 drop(replies);
                 Some(event)
@@ -536,11 +537,17 @@ impl Router {
                         text = %payload,
                         "mesh -> mesh"
                     );
-                    if let (Some(event), Some(id)) = (event, sent.reference) {
-                        self.replies
-                            .lock()
-                            .await
-                            .remember(event, &route.network, id, now);
+                    if let Some(event) = event {
+                        let mut replies = self.replies.lock().await;
+                        if let Some(id) = sent.reference {
+                            replies.remember(event, &route.network, id, now);
+                        }
+                        // The copy on this mesh is a different message with a
+                        // different name, and a reaction from Matrix has to
+                        // name the one it is going out on.
+                        if let Some(id) = sent.reaction_ref {
+                            replies.remember_reactable(event, &route.network, id, now);
+                        }
                     }
                 }
                 Err(error) => warn!(
@@ -603,6 +610,12 @@ impl Router {
                     let mut replies = self.replies.lock().await;
                     replies.remember_correspondent(&event, &message.network, peer, now);
                     if let Some(reference) = message.reaction_ref.as_ref() {
+                        replies.remember_reactable(
+                            &event,
+                            &message.network,
+                            reference.clone(),
+                            now,
+                        );
                         replies.remember_posted(
                             &message.network,
                             reference,
@@ -680,7 +693,8 @@ impl Router {
                 if let Some(reference) = delivery.reaction_ref.as_ref() {
                     // What we just said is also something the far node may react
                     // to, and its reaction belongs on the message written here.
-                    self.replies.lock().await.remember_posted(
+                    let mut replies = self.replies.lock().await;
+                    replies.remember_posted(
                         &network,
                         reference,
                         Posted {
@@ -690,6 +704,7 @@ impl Router {
                         },
                         now,
                     );
+                    replies.remember_reactable(&message.event_id, &network, reference.clone(), now);
                 }
                 self.confirm(delivery, &message.room_id, &message.event_id, network, who);
             }
@@ -884,6 +899,14 @@ impl Router {
                             },
                             now,
                         );
+                        // Including a reaction to it written here: somebody may
+                        // well thumbs-up what they just read going out.
+                        replies.remember_reactable(
+                            &message.event_id,
+                            &route.network,
+                            reference.clone(),
+                            now,
+                        );
                     }
                     drop(replies);
                     if let Some(watch) = sent.relays {
@@ -902,6 +925,163 @@ impl Router {
                     "failed to relay a Matrix message to the mesh"
                 ),
             }
+        }
+    }
+
+    /// Carry a reaction written in Matrix out to the meshes bridged to its room.
+    ///
+    /// The mirror of [`relay_reaction`], and less forgiving than it. A mesh
+    /// reaction that cannot be placed is still said in the room, because a
+    /// line of Matrix text costs nothing; one going this way is dropped
+    /// instead. The alternatives are both worse: a line of text spends the
+    /// payload of a real message on `alice reacted 👍`, and a malformed
+    /// reaction spends it on something no client can read at all.
+    ///
+    /// [`relay_reaction`]: Router::relay_reaction
+    pub async fn handle_matrix_reaction(&self, reaction: MatrixReaction, now: Instant) {
+        if reaction.sender == self.matrix.user_id() {
+            return;
+        }
+        if self.inboxes.contains(&reaction.room_id) {
+            self.react_to_correspondent(&reaction, now).await;
+            return;
+        }
+        let Some(routes) = self.outbound.get(&reaction.room_id) else {
+            debug!(room = %reaction.room_id, "a reaction in an unbridged room, dropping");
+            return;
+        };
+
+        let names = Names::of_matrix_user(matrix_localpart(&reaction.sender));
+        for route in routes {
+            let Some(backend) = self.backends.get(&route.network) else {
+                continue;
+            };
+
+            // Both names for the message, because which one is needed is the
+            // backend's business: a packet id here, a fingerprint and the
+            // author's name there.
+            let (about, reply_to) = {
+                let replies = self.replies.lock().await;
+                (
+                    replies.reaction_for(&reaction.about, &route.network, now),
+                    replies.message_for(&reaction.about, &route.network, now),
+                )
+            };
+            let Some(about) = about else {
+                debug!(
+                    room = %reaction.room_id,
+                    network = %route.network,
+                    "a reaction to something this mesh does not know, dropping"
+                );
+                continue;
+            };
+
+            // Rendered but never cut: a reaction ends in a fingerprint, and a
+            // fingerprint with its tail missing names nothing. A backend that
+            // cannot fit it says so instead.
+            let prefix = prefix::render(
+                self.relay.matrix_to_mesh(Some(backend.kind())),
+                &names.vars(&route.network, "", Some(route.channel)),
+            );
+
+            // Remembered before it goes out, like every other send: a radio
+            // that reports what it transmits reports it to us as well, and an
+            // echo arriving before we were ready for it is an echo relayed
+            // straight back into the room it came from.
+            self.dedupe.lock().await.remember(
+                reaction_key(
+                    &route.network,
+                    Some(route.channel),
+                    &about,
+                    &echo_reactor(backend.as_ref(), &prefix),
+                    &reaction.key,
+                ),
+                now,
+            );
+
+            let carried = Reaction {
+                prefix: &prefix,
+                emoji: &reaction.key,
+                reply_to: reply_to.as_ref(),
+                about: Some(&about),
+            };
+            match backend.react_channel(route.channel, &carried).await {
+                Ok(()) => info!(
+                    room = %reaction.room_id,
+                    network = %route.network,
+                    channel = route.channel,
+                    sender = %names.name,
+                    emoji = %reaction.key,
+                    about = %about,
+                    "matrix -> mesh reaction"
+                ),
+                // Debug rather than a warning: the commonest reason by far is a
+                // reaction this protocol has no way of writing, which is a fact
+                // about the mesh and not a fault.
+                Err(error) => debug!(
+                    network = %route.network,
+                    "{error:#}"
+                ),
+            }
+        }
+    }
+
+    /// A reaction written in a DM inbox, which goes back to whoever wrote the
+    /// message it is on.
+    ///
+    /// Resolved the same way an answer written there is, and for the same
+    /// reason: an inbox holds everybody's direct messages at once, so it is the
+    /// message being annotated that says who is being answered. A reaction on
+    /// anything else in the room — including on what somebody here sent out —
+    /// names nobody, and stays in Matrix.
+    async fn react_to_correspondent(&self, reaction: &MatrixReaction, now: Instant) {
+        let (network, peer, about) = {
+            let replies = self.replies.lock().await;
+            let Some((network, peer)) = replies.correspondent(&reaction.about, now) else {
+                debug!(
+                    room = %reaction.room_id,
+                    "a reaction on something that is not somebody's direct message, dropping"
+                );
+                return;
+            };
+            let about = replies.reaction_for(&reaction.about, &network, now);
+            (network, peer, about)
+        };
+        let Some(backend) = self.backends.get(&network) else {
+            warn!(network = %network, "no backend to carry a reaction on");
+            return;
+        };
+        let Some(about) = about else {
+            debug!(
+                network = %network,
+                "a reaction to a direct message this mesh cannot name, dropping"
+            );
+            return;
+        };
+
+        let carried = Reaction {
+            // Nothing is written in front of it: between two people there is
+            // nobody to name, and a name there would stop the far client
+            // reading this as a reaction at all.
+            prefix: "",
+            emoji: &reaction.key,
+            reply_to: None,
+            about: Some(&about),
+        };
+        let who = backend
+            .resolve_name(&peer)
+            .unwrap_or_else(|| peer.to_string());
+        // Who and where, never what — the same as the message it is on. An
+        // emoji is short, and in a conversation of two it is still somebody
+        // saying something to one person.
+        match backend.react_direct(&peer, &carried).await {
+            Ok(()) => info!(
+                room = %reaction.room_id,
+                network = %network,
+                peer = %who,
+                "matrix -> direct message reaction"
+            ),
+            Err(error) => debug!(network = %network, "{error:#}"),
         }
     }
 
@@ -985,6 +1165,45 @@ fn require_backend(
     }
 }
 
+/// What a reaction of ours will look like coming back, where the radio hands
+/// our own transmissions back to us.
+///
+/// [`reaction_key`] names the reactor by whatever the protocol carried: an
+/// address where there is one, and otherwise the name the sending client wrote
+/// into the text — which for a message of ours is whatever the prefix template
+/// put in front of it, read back the way the backend will read it.
+///
+/// Guessing wrong costs one duplicate line in a room, not a loop.
+fn echo_reactor(backend: &dyn MeshBackend, prefix: &str) -> String {
+    if let Some(address) = backend.own_address() {
+        return address.to_string();
+    }
+    prefix
+        .split_once(": ")
+        .map_or_else(String::new, |(name, _)| name.to_owned())
+}
+
+/// The duplicate-suppression key for one reaction.
+///
+/// What it is about and who sent it are what make a reaction its own: the text
+/// is a couple of bytes of emoji, so two people agreeing with the same message
+/// would otherwise collapse into one. The same reaction reaching us twice —
+/// one node heard over LoRa and over MQTT, or our own coming straight back out
+/// of the radio — still collapses, which is the point.
+fn reaction_key(
+    network: &str,
+    channel: Option<u8>,
+    about: &MessageRef,
+    reactor: &str,
+    emoji: &str,
+) -> u64 {
+    message_key(
+        network,
+        channel,
+        &format!("{about}\u{0}{reactor}\u{0}{emoji}"),
+    )
+}
+
 /// One dish per repeater, or the empty mailbox for none.
 ///
 /// Past [`MOST_DISHES`] it says "at least that many" with a trailing `+` rather
@@ -1035,6 +1254,7 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     use super::*;
+    use crate::matrix::MatrixEvent;
     use crate::mesh::{Broadcast, MeshKind, PeerId, Sender};
 
     /// Records what it was asked to transmit instead of touching a radio.
@@ -1055,6 +1275,11 @@ mod tests {
         /// What the watch on the next broadcast reports: a count, or `None` for
         /// "could not tell which message was ours".
         relays: Mutex<Option<usize>>,
+        /// Reactions that reached the mesh: the channel, what was said, and
+        /// what it was said about.
+        reactions: Mutex<Vec<(u8, String, MessageRef)>>,
+        /// And the same within a direct message.
+        dm_reactions: Mutex<Vec<(PeerId, String, MessageRef)>>,
     }
 
     impl FakeBackend {
@@ -1067,6 +1292,8 @@ mod tests {
                 dms: Mutex::new(Vec::new()),
                 ack: Mutex::new(Some(true)),
                 relays: Mutex::new(Some(0)),
+                reactions: Mutex::new(Vec::new()),
+                dm_reactions: Mutex::new(Vec::new()),
             })
         }
 
@@ -1085,6 +1312,18 @@ mod tests {
             self.dms.lock().await.clone()
         }
 
+        /// What a reaction may name here, refused exactly where the real
+        /// backend would refuse it.
+        fn reaction_target(&self, reaction: &Reaction<'_>) -> Result<MessageRef> {
+            match (self.kind, reaction.about, reaction.reply_to) {
+                (MeshKind::Meshtastic, Some(about @ MessageRef::Packet(_)), _) => Ok(about.clone()),
+                // A channel reaction also needs the author, which is what the
+                // marker names; a direct one has nobody to name.
+                (MeshKind::MeshCore, Some(about @ MessageRef::Digest(_)), _) => Ok(about.clone()),
+                _ => bail!("nothing on {} for a reaction to name", self.id),
+            }
+        }
+
         /// `Some(true)` acknowledges, `Some(false)` refuses, `None` stays silent
         /// so the wait times out.
         async fn answers_with(&self, ack: Option<bool>) {
@@ -1094,6 +1333,14 @@ mod tests {
         /// What the next broadcast's watch will report.
         async fn repeated_by(&self, heard: Option<usize>) {
             *self.relays.lock().await = heard;
+        }
+
+        async fn reactions(&self) -> Vec<(u8, String, MessageRef)> {
+            self.reactions.lock().await.clone()
+        }
+
+        async fn dm_reactions(&self) -> Vec<(PeerId, String, MessageRef)> {
+            self.dm_reactions.lock().await.clone()
         }
 
         /// What each of those was a reply to.
@@ -1156,9 +1403,16 @@ mod tests {
                     .map(|(name, _)| MessageRef::Author(name.to_owned())),
             };
             Ok(Broadcast {
-                // In a test the two are the same thing: what matters is that
-                // the router indexes by one and replies by the other.
-                reaction_ref: reference.clone(),
+                // As the real backends: a packet answers for both, while a
+                // MeshCore message is replied to by name and reacted to by
+                // fingerprint. Eight characters of the alphabet, as a real one
+                // is, and distinct per message so two of them cannot collide.
+                reaction_ref: match self.kind {
+                    MeshKind::Meshtastic => reference.clone(),
+                    MeshKind::MeshCore => {
+                        Some(MessageRef::Digest(format!("sent{:04}", sent.len())))
+                    }
+                },
                 reference,
                 // As the real backends: only MeshCore can overhear repeaters.
                 // Answered at once, since the waiting is the real backend's and
@@ -1187,8 +1441,43 @@ mod tests {
             })
         }
 
+        /// Refuses what the protocol it stands in for would refuse, which is
+        /// the half of this worth testing: Meshtastic names a packet, MeshCore
+        /// names the author and fingerprints the message, and neither can send
+        /// a reaction against the other's reference.
+        async fn react_channel(&self, channel: u8, reaction: &Reaction<'_>) -> Result<()> {
+            let about = self.reaction_target(reaction)?;
+            // MC1 writes the reaction against the name of whoever wrote the
+            // message, so a channel reaction without one cannot be written.
+            if self.kind == MeshKind::MeshCore
+                && !matches!(reaction.reply_to, Some(MessageRef::Author(_)))
+            {
+                bail!("nobody to name in a reaction on {}", self.id);
+            }
+            self.reactions
+                .lock()
+                .await
+                .push((channel, reaction.emoji.to_owned(), about));
+            Ok(())
+        }
+
+        async fn react_direct(&self, peer: &PeerId, reaction: &Reaction<'_>) -> Result<()> {
+            let about = self.reaction_target(reaction)?;
+            self.dm_reactions
+                .lock()
+                .await
+                .push((peer.clone(), reaction.emoji.to_owned(), about));
+            Ok(())
+        }
+
         fn resolve_name(&self, _peer: &PeerId) -> Option<String> {
             None
+        }
+
+        /// As a Meshtastic radio: it has a node number, and reports what it
+        /// transmits to every client attached, this one included.
+        fn own_address(&self) -> Option<PeerId> {
+            (self.kind == MeshKind::Meshtastic).then_some(PeerId::Node(OWN_NODE))
         }
     }
 
@@ -1250,7 +1539,7 @@ mod tests {
             Ok(())
         }
 
-        async fn run(&self, _tx: mpsc::Sender<MatrixMessage>) -> Result<()> {
+        async fn run(&self, _tx: mpsc::Sender<MatrixEvent>) -> Result<()> {
             Ok(())
         }
 
@@ -1349,6 +1638,10 @@ mod tests {
     /// And the one a Meshtastic-shaped fake says its direct messages went out as.
     const DM_PACKET: u32 = 0xd1;
 
+    /// The node number a Meshtastic-shaped fake answers to, which is how its
+    /// own transmissions are recognized coming back.
+    const OWN_NODE: u32 = 0x10c;
+
     fn from_mesh(network: &str, channel: u8, name: Option<&str>, text: &str) -> IncomingMesh {
         IncomingMesh {
             network: network.to_owned(),
@@ -1367,12 +1660,31 @@ mod tests {
         }
     }
 
-    /// A MeshCore channel message, which points at its author rather than at a
-    /// packet, because that is all its protocol says about itself.
+    /// A MeshCore channel message, where a reply names the author and a
+    /// reaction the fingerprint of the message, because that is all its
+    /// protocol says about itself.
     fn from_meshcore(network: &str, channel: u8, name: &str, text: &str) -> IncomingMesh {
         IncomingMesh {
             reference: Some(MessageRef::Author(name.to_owned())),
+            reaction_ref: Some(mesh_digest()),
             ..from_mesh(network, channel, Some(name), text)
+        }
+    }
+
+    /// The fingerprint every `from_meshcore` message carries, which is what a
+    /// reaction to it has to name.
+    fn mesh_digest() -> MessageRef {
+        MessageRef::Digest("b45pc4ek".to_owned())
+    }
+
+    /// Somebody in Matrix annotating an event, which is what a reaction there
+    /// is: no body, and everything in the relation.
+    fn reacting_in_matrix(room: &str, sender: &str, about: &str, key: &str) -> MatrixReaction {
+        MatrixReaction {
+            room_id: room.to_owned(),
+            sender: sender.to_owned(),
+            about: about.to_owned(),
+            key: key.to_owned(),
         }
     }
 
@@ -2236,6 +2548,215 @@ mod tests {
             h.sink.emotes().await,
             ["BOB reacted 😂 to \"hola a todos\"".to_owned()],
             "named, and quoting what it was about"
+        );
+    }
+
+    /// The other direction, which Meshtastic has a packet field for: the
+    /// reaction goes out naming the packet it is about.
+    #[tokio::test]
+    async fn a_matrix_reaction_reaches_meshtastic_as_a_tapback() {
+        let h = harness(ONE_ROOM);
+        let now = Instant::now();
+        h.router
+            .handle_mesh(from_mesh("lora", 0, Some("Alice"), "hola"), now)
+            .await;
+
+        h.router
+            .handle_matrix_reaction(
+                reacting_in_matrix(
+                    "!room:example.org",
+                    "@bob:example.org",
+                    &FakeSink::event_id(1),
+                    "👍",
+                ),
+                now,
+            )
+            .await;
+
+        assert_eq!(
+            h.lora.reactions().await,
+            [(0, "👍".to_owned(), mesh_packet())]
+        );
+        assert!(
+            h.lora.sent().await.is_empty(),
+            "a reaction is not a message, and must not spend a message's payload"
+        );
+    }
+
+    /// And MeshCore, where it takes both names at once: the fingerprint of the
+    /// message, and the author the marker is written against.
+    #[tokio::test]
+    async fn a_matrix_reaction_reaches_meshcore_naming_the_message() {
+        let h = harness(MESHCORE_ROOM);
+        let now = Instant::now();
+        h.router
+            .handle_mesh(from_meshcore("mc", 0, "ALICE", "Hola a todos"), now)
+            .await;
+
+        h.router
+            .handle_matrix_reaction(
+                reacting_in_matrix(
+                    "!room:example.org",
+                    "@bob:example.org",
+                    &FakeSink::event_id(1),
+                    "😂",
+                ),
+                now,
+            )
+            .await;
+
+        assert_eq!(
+            h.mc.reactions().await,
+            [(0, "😂".to_owned(), mesh_digest())],
+            "the fake refuses this unless the author came with it"
+        );
+    }
+
+    /// A reaction to a message of ours, which is the case that only works
+    /// because the relay knows the fingerprint of what it sent.
+    #[tokio::test]
+    async fn a_matrix_reaction_can_land_on_what_matrix_itself_said() {
+        let h = harness(MESHCORE_ROOM);
+        let now = Instant::now();
+        h.router
+            .handle_matrix(
+                from_matrix("!room:example.org", "@bob:example.org", "hola"),
+                now,
+            )
+            .await;
+
+        h.router
+            .handle_matrix_reaction(
+                reacting_in_matrix(
+                    "!room:example.org",
+                    "@carol:example.org",
+                    "$typed:example.org",
+                    "😂",
+                ),
+                now,
+            )
+            .await;
+
+        let reactions = h.mc.reactions().await;
+        assert_eq!(reactions.len(), 1, "it has to name what we put on the air");
+        assert_eq!(reactions[0].1, "😂");
+    }
+
+    /// Nothing to name it by, so nothing goes out. The other direction says it
+    /// in words instead, because a Matrix line is cheap and a LoRa payload is
+    /// not.
+    #[tokio::test]
+    async fn a_matrix_reaction_to_something_the_mesh_forgot_stays_in_matrix() {
+        let h = harness(ONE_ROOM);
+        h.router
+            .handle_matrix_reaction(
+                reacting_in_matrix(
+                    "!room:example.org",
+                    "@bob:example.org",
+                    "$long:example.org",
+                    "👍",
+                ),
+                Instant::now(),
+            )
+            .await;
+
+        assert!(h.lora.reactions().await.is_empty());
+        assert!(h.lora.sent().await.is_empty());
+    }
+
+    /// The relay marks its own messages — the delivery tick, the dishes, every
+    /// reaction it relays from the mesh — and not one of those is somebody
+    /// reacting.
+    #[tokio::test]
+    async fn the_relay_never_relays_its_own_marks() {
+        let h = harness(ONE_ROOM);
+        let now = Instant::now();
+        h.router
+            .handle_mesh(from_mesh("lora", 0, Some("Alice"), "hola"), now)
+            .await;
+
+        h.router
+            .handle_matrix_reaction(
+                reacting_in_matrix(
+                    "!room:example.org",
+                    "@relay:example.org",
+                    &FakeSink::event_id(1),
+                    "✓",
+                ),
+                now,
+            )
+            .await;
+
+        assert!(h.lora.reactions().await.is_empty());
+    }
+
+    /// A reaction written in a DM inbox goes back to the person whose message
+    /// it is on, the same way an answer written there does.
+    #[tokio::test]
+    async fn a_matrix_reaction_in_a_dm_inbox_answers_its_correspondent() {
+        let h = harness(DM_ROOMS);
+        let now = Instant::now();
+        h.router
+            .handle_mesh(direct("lora", Some("Alice"), "estas ahi?"), now)
+            .await;
+
+        h.router
+            .handle_matrix_reaction(
+                reacting_in_matrix(
+                    "!dm:example.org",
+                    "@bob:example.org",
+                    &FakeSink::event_id(1),
+                    "👍",
+                ),
+                now,
+            )
+            .await;
+
+        let reactions = h.lora.dm_reactions().await;
+        assert_eq!(reactions.len(), 1, "it goes to whoever wrote the message");
+        assert_eq!(reactions[0].1, "👍");
+        assert!(
+            h.lora.dms().await.is_empty(),
+            "and not as a direct message of its own"
+        );
+    }
+
+    /// Our own reaction, handed straight back by the radio. It is already in
+    /// the room it came from, and relaying it would say the same thing twice.
+    #[tokio::test]
+    async fn a_reaction_of_ours_is_not_relayed_back_into_its_room() {
+        let h = harness(ONE_ROOM);
+        let now = Instant::now();
+        h.router
+            .handle_mesh(from_mesh("lora", 0, Some("Alice"), "hola"), now)
+            .await;
+        h.router
+            .handle_matrix_reaction(
+                reacting_in_matrix(
+                    "!room:example.org",
+                    "@bob:example.org",
+                    &FakeSink::event_id(1),
+                    "👍",
+                ),
+                now,
+            )
+            .await;
+
+        // As the radio reports it: our own node number, our own emoji, on the
+        // message we named.
+        let echo = IncomingMesh {
+            sender: Some(Sender {
+                id: Some(PeerId::Node(OWN_NODE)),
+                long_name: None,
+                short_name: None,
+            }),
+            ..reacting(from_mesh("lora", 0, Some("Alice"), ""), mesh_packet(), "👍")
+        };
+        h.router.handle_mesh(echo, now).await;
+
+        assert!(
+            h.sink.emotes().await.is_empty(),
+            "the room already shows this reaction, posted by whoever wrote it"
         );
     }
 

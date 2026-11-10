@@ -50,6 +50,32 @@ pub struct MatrixMessage {
     pub reply_to: Option<EventId>,
 }
 
+/// A reaction observed in a bridged room: somebody annotating an event with a
+/// short key, which clients render as an emoji under the message.
+#[derive(Clone, Debug)]
+pub struct MatrixReaction {
+    pub room_id: RoomId,
+    /// Full user id of the sender, so the relay's own marks — the delivery
+    /// tick, the dishes, the reactions it relays from the mesh — are not
+    /// relayed back out as reactions of their own.
+    pub sender: String,
+    /// The event being annotated.
+    pub about: EventId,
+    /// The annotation. Any short string on Matrix, an emoji in practice.
+    pub key: String,
+}
+
+/// Something observed in a bridged room that the relay may have to carry.
+///
+/// Two variants rather than one type with everything optional: a reaction has
+/// no body and a message has no key, and a message that pretends otherwise is
+/// one `unwrap` away from a panic.
+#[derive(Clone, Debug)]
+pub enum MatrixEvent {
+    Message(MatrixMessage),
+    Reaction(MatrixReaction),
+}
+
 #[async_trait]
 pub trait MatrixSink: Send + Sync {
     /// The relay's own user id.
@@ -58,8 +84,9 @@ pub trait MatrixSink: Send + Sync {
     /// Join the bridged rooms, resolving aliases. Idempotent.
     async fn join_rooms(&self, rooms: &[RoomId]) -> Result<()>;
 
-    /// Stream room messages into `tx` until cancelled, reconnecting as needed.
-    async fn run(&self, tx: mpsc::Sender<MatrixMessage>) -> Result<()>;
+    /// Stream what happens in the bridged rooms into `tx` until cancelled,
+    /// reconnecting as needed.
+    async fn run(&self, tx: mpsc::Sender<MatrixEvent>) -> Result<()>;
 
     /// Post a message and report the id the server gave it, which is what ties
     /// it to whatever came back over the mesh.

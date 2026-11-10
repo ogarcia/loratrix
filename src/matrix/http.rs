@@ -10,13 +10,13 @@
 //! was configured with.
 //!
 //! And **the sync filter is an optimization, never a guarantee**. It asks for the
-//! bridged rooms only, messages only, and no history on the first request, which
-//! on a homeserver that honours it saves a great deal of traffic. Not every one
-//! does: conduwuit ignores `/sync` filters completely, inline or registered, and
-//! answers with the last ten events of every joined room regardless. So the two
-//! things that matter for correctness — starting from now rather than from
-//! history, and only relaying rooms we bridge — are done here in code, and the
-//! filter is sent on top of that.
+//! bridged rooms only, messages and reactions only, and no history on the first
+//! request, which on a homeserver that honours it saves a great deal of
+//! traffic. Not every one does: conduwuit ignores `/sync` filters completely,
+//! inline or registered, and answers with the last ten events of every joined
+//! room regardless. So the two things that matter for correctness — starting
+//! from now rather than from history, and only relaying rooms we bridge — are
+//! done here in code, and the filter is sent on top of that.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,7 +31,9 @@ use tokio::time::sleep;
 use tracing::{debug, info, trace, warn};
 
 use crate::config::MatrixConfig;
-use crate::matrix::{EventId, MatrixMessage, MatrixSink, MsgKind, RoomId};
+use crate::matrix::{
+    EventId, MatrixEvent, MatrixMessage, MatrixReaction, MatrixSink, MsgKind, RoomId,
+};
 
 /// How long the server may hold a `/sync` open waiting for something to happen.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -121,7 +123,10 @@ impl HttpSink {
                 "ephemeral": { "not_types": ["*"] },
                 "account_data": { "not_types": ["*"] },
                 "state": { "not_types": ["*"] },
-                "timeline": { "limit": history, "types": ["m.room.message"] },
+                "timeline": {
+                    "limit": history,
+                    "types": ["m.room.message", "m.reaction"],
+                },
             },
         })
         .to_string()
@@ -158,6 +163,46 @@ impl HttpSink {
             bail!("sync failed with {status}: {body}");
         }
         response.json().await.context("reading the sync response")
+    }
+
+    /// Turn a timeline event into something worth relaying, of either kind.
+    fn relayable(&self, room: &str, event: &TimelineEvent) -> Option<MatrixEvent> {
+        // Our own echo, including every mark the relay puts on a message of its
+        // own: the delivery tick, the dishes, and the reactions it relays from
+        // the mesh. Dropped here as well as in the router, because there is no
+        // sense carrying it any further — and because a relay that reacted to
+        // its own reactions would do so for as long as it was running.
+        if event.sender == self.user_id {
+            return None;
+        }
+        match event.kind.as_str() {
+            "m.room.message" => self.message(room, event).map(MatrixEvent::Message),
+            "m.reaction" => self.reaction(room, event).map(MatrixEvent::Reaction),
+            _ => None,
+        }
+    }
+
+    /// A reaction, which says nothing in its body and everything in its
+    /// relation: what it annotates, and with what.
+    fn reaction(&self, room: &str, event: &TimelineEvent) -> Option<MatrixReaction> {
+        let relation = event.content.relates_to.as_ref()?;
+        // Edits and threads are relations too, and neither is an annotation.
+        if relation.rel_type.as_deref() != Some("m.annotation") {
+            trace!(room, "a relation that is not an annotation");
+            return None;
+        }
+        let about = relation.event_id.clone()?;
+        let key = relation.key.clone()?;
+        if key.is_empty() {
+            return None;
+        }
+
+        Some(MatrixReaction {
+            room_id: room.to_owned(),
+            sender: event.sender.clone(),
+            about,
+            key,
+        })
     }
 
     /// Turn a timeline event into something worth relaying.
@@ -272,7 +317,7 @@ impl MatrixSink for HttpSink {
         Ok(())
     }
 
-    async fn run(&self, tx: mpsc::Sender<MatrixMessage>) -> Result<()> {
+    async fn run(&self, tx: mpsc::Sender<MatrixEvent>) -> Result<()> {
         // A position in the stream, and nothing else kept. The filter asks for no
         // history, but a server that ignores filters answers with the tail of
         // every room, and relaying that would read yesterday's conversation out
@@ -321,8 +366,8 @@ impl MatrixSink for HttpSink {
                     continue;
                 };
                 for event in &joined.timeline.events {
-                    if let Some(message) = self.message(&configured, event)
-                        && tx.send(message).await.is_err()
+                    if let Some(relayable) = self.relayable(&configured, event)
+                        && tx.send(relayable).await.is_err()
                     {
                         return Ok(());
                     }
@@ -445,8 +490,9 @@ struct EventContent {
     msgtype: Option<String>,
     #[serde(default)]
     body: Option<String>,
-    /// How this event relates to another. Only `m.in_reply_to` is read; edits,
-    /// annotations and threads are relations we have nowhere to put.
+    /// How this event relates to another: a reply nests the event it answers,
+    /// an annotation names it and says what it says. Edits and threads are
+    /// relations we have nowhere to put.
     #[serde(default, rename = "m.relates_to")]
     relates_to: Option<Relation>,
 }
@@ -455,6 +501,17 @@ struct EventContent {
 struct Relation {
     #[serde(default, rename = "m.in_reply_to")]
     in_reply_to: Option<InReplyTo>,
+    /// `m.annotation` for a reaction. Absent on the reply relation above,
+    /// which says what it is by the field it uses.
+    #[serde(default)]
+    rel_type: Option<String>,
+    /// What an annotation is on, which a reply instead nests inside
+    /// `m.in_reply_to`.
+    #[serde(default)]
+    event_id: Option<String>,
+    /// And what it says: an emoji, by convention rather than by rule.
+    #[serde(default)]
+    key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -776,10 +833,12 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let running = tokio::spawn(async move { sink.run(tx).await });
 
-        let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("a message should arrive")
-            .expect("the channel stays open");
+        let message = as_message(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a message should arrive")
+                .expect("the channel stays open"),
+        );
         assert_eq!(message.room_id, "!room:example.org");
         assert_eq!(message.sender, "@alice:example.org");
         assert_eq!(message.body, "hola");
@@ -825,10 +884,12 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let running = tokio::spawn(async move { sink.run(tx).await });
 
-        let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("a message should arrive")
-            .expect("the channel stays open");
+        let message = as_message(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a message should arrive")
+                .expect("the channel stays open"),
+        );
         assert_eq!(message.event_id, "$answer");
         assert_eq!(message.reply_to.as_deref(), Some("$original"));
         assert_eq!(
@@ -838,6 +899,14 @@ mod tests {
 
         drop(rx);
         let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+    }
+
+    /// The message inside a relayed event, for the tests that expect one.
+    fn as_message(event: MatrixEvent) -> MatrixMessage {
+        match event {
+            MatrixEvent::Message(message) => message,
+            MatrixEvent::Reaction(reaction) => panic!("expected a message, got {reaction:?}"),
+        }
     }
 
     /// A homeserver that ignores the filter, which is not hypothetical: conduwuit
@@ -874,10 +943,12 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         tokio::spawn(async move { sink.run(tx).await });
 
-        let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("a message should arrive")
-            .expect("the channel stays open");
+        let message = as_message(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a message should arrive")
+                .expect("the channel stays open"),
+        );
         assert_eq!(
             message.body, "said just now",
             "the primed batch must be dropped whatever the server chose to send"
@@ -915,10 +986,12 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         tokio::spawn(async move { sink.run(tx).await });
 
-        let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("a message should arrive")
-            .expect("the channel stays open");
+        let message = as_message(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a message should arrive")
+                .expect("the channel stays open"),
+        );
         assert_eq!(message.body, "ours");
         assert_eq!(message.room_id, "!room:example.org");
 
@@ -962,6 +1035,71 @@ mod tests {
             let event: TimelineEvent = serde_json::from_str(raw).expect("valid json");
             assert!(
                 sink.message("!room:example.org", &event).is_none(),
+                "{what} must not be relayed"
+            );
+        }
+    }
+
+    /// A reaction says nothing in its body and everything in its relation.
+    #[tokio::test]
+    async fn reads_an_annotation_as_a_reaction() {
+        let sink = HttpSink::new(&config("https://matrix.example.org")).expect("valid");
+        let raw = r#"{"type":"m.reaction","event_id":"$r","sender":"@alice:example.org",
+            "content":{"m.relates_to":{"rel_type":"m.annotation","event_id":"$said","key":"👍"}}}"#;
+        let event: TimelineEvent = serde_json::from_str(raw).expect("valid json");
+
+        let Some(MatrixEvent::Reaction(reaction)) = sink.relayable("!room:example.org", &event)
+        else {
+            panic!("a reaction should be relayable");
+        };
+        assert_eq!(reaction.room_id, "!room:example.org");
+        assert_eq!(reaction.sender, "@alice:example.org");
+        assert_eq!(reaction.about, "$said");
+        assert_eq!(reaction.key, "👍");
+
+        // And the filter asks for them, so a homeserver that honours it sends
+        // them at all.
+        assert!(sink.filter(0).await.contains("m.reaction"));
+    }
+
+    /// Everything shaped like a reaction that is not one, including the relay's
+    /// own marks — which it would otherwise read back and send to the mesh as
+    /// somebody reacting.
+    #[tokio::test]
+    async fn ignores_what_is_not_somebody_reacting() {
+        let sink = HttpSink::new(&config("https://matrix.example.org")).expect("valid");
+
+        let cases = [
+            (
+                r#"{"type":"m.reaction","event_id":"$r","sender":"@relay:example.org",
+                   "content":{"m.relates_to":{"rel_type":"m.annotation","event_id":"$s","key":"✓"}}}"#,
+                "our own delivery tick",
+            ),
+            (
+                r#"{"type":"m.reaction","event_id":"$r","sender":"@a:x",
+                   "content":{"m.relates_to":{"rel_type":"m.replace","event_id":"$s","key":"👍"}}}"#,
+                "an edit wearing a key",
+            ),
+            (
+                r#"{"type":"m.reaction","event_id":"$r","sender":"@a:x",
+                   "content":{"m.relates_to":{"rel_type":"m.annotation","event_id":"$s"}}}"#,
+                "an annotation that says nothing",
+            ),
+            (
+                r#"{"type":"m.reaction","event_id":"$r","sender":"@a:x",
+                   "content":{"m.relates_to":{"rel_type":"m.annotation","key":"👍"}}}"#,
+                "an annotation on nothing",
+            ),
+            (
+                r#"{"type":"m.reaction","event_id":"$r","sender":"@a:x","content":{}}"#,
+                "a redacted reaction",
+            ),
+        ];
+
+        for (raw, what) in cases {
+            let event: TimelineEvent = serde_json::from_str(raw).expect("valid json");
+            assert!(
+                sink.relayable("!room:example.org", &event).is_none(),
                 "{what} must not be relayed"
             );
         }
@@ -1061,7 +1199,7 @@ mod tests {
                     .unwrap_or_else(|| room.clone());
                 for event in &joined.timeline.events {
                     events += 1;
-                    match sink.message(&configured, event) {
+                    match sink.relayable(&configured, event) {
                         Some(message) => {
                             relayed += 1;
                             println!("would relay {message:?}");
@@ -1120,10 +1258,12 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         tokio::spawn(async move { sink.run(tx).await });
 
-        let message = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .expect("the loop should survive the error")
-            .expect("the channel stays open");
+        let message = as_message(
+            tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("the loop should survive the error")
+                .expect("the channel stays open"),
+        );
         assert_eq!(message.body, "after the error");
     }
 }

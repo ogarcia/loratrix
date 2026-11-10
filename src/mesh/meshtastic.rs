@@ -31,7 +31,7 @@ use tracing::{debug, info, trace, warn};
 use crate::config::{NetworkConfig, NetworkKind, Transport};
 use crate::mesh::{
     Broadcast, Delivery, IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin,
-    PeerId, Sender,
+    PeerId, Reaction, Sender,
 };
 
 /// Every node, rather than one of them. Meshtastic has no constant for it.
@@ -90,6 +90,22 @@ impl std::fmt::Display for Link {
             Link::Serial { port, baud } => write!(f, "{port}@{baud}"),
         }
     }
+}
+
+/// The two bits of a packet that say what sort of thing is going out, rather
+/// than what it says.
+///
+/// Together rather than as a pair of arguments, because `(.., true, false)` at
+/// a call site says nothing about which is which.
+#[derive(Clone, Copy, Debug, Default)]
+struct Outgoing {
+    /// Ask the far node to acknowledge. Worth it for a direct message, where
+    /// one node is expected to answer; never on a broadcast, which every hearer
+    /// would answer at once.
+    want_ack: bool,
+    /// This text is a tapback: an emoji annotating the message named by
+    /// `reply_id`, rather than something somebody typed.
+    tapback: bool,
 }
 
 /// Whether the pump wants another connection or the relay is going away.
@@ -575,7 +591,7 @@ impl MeshtasticBackend {
         channel: MeshChannel,
         text: &str,
         reply_to: Option<&MessageRef>,
-        want_ack: bool,
+        kind: Outgoing,
     ) -> protobufs::MeshPacket {
         protobufs::MeshPacket {
             payload_variant: Some(protobufs::mesh_packet::PayloadVariant::Decoded(
@@ -590,6 +606,10 @@ impl MeshtasticBackend {
                         // is what an ordinary message carries.
                         _ => 0,
                     },
+                    // The one bit that tells a tapback from somebody typing a
+                    // thumbs-up on its own. Clients read it together with
+                    // `reply_id`, and neither means anything without the other.
+                    emoji: u32::from(kind.tapback),
                     ..Default::default()
                 },
             )),
@@ -605,11 +625,26 @@ impl MeshtasticBackend {
             // and the answer means something. Never on a broadcast: there is no
             // single node it would come from, and asking would have every hearer
             // reply.
-            want_ack,
+            want_ack: kind.want_ack,
             // What the reference client sends for a message a person typed. Left
             // unset the firmware picks for us, and picks lower.
             priority: protobufs::mesh_packet::Priority::Reliable as i32,
             ..Default::default()
+        }
+    }
+
+    /// Which packet a reaction from Matrix is about.
+    ///
+    /// Only a packet id names one. A fingerprint or an author names a MeshCore
+    /// message, and a reaction with neither is about something this mesh never
+    /// carried or has already been forgotten.
+    fn tapback_target(&self, reaction: &Reaction<'_>) -> Result<MessageRef> {
+        match reaction.about {
+            Some(MessageRef::Packet(id)) => Ok(MessageRef::Packet(*id)),
+            _ => bail!(
+                "nothing on {} for a reaction to name, so it stays in Matrix",
+                self.id
+            ),
         }
     }
 
@@ -621,7 +656,7 @@ impl MeshtasticBackend {
         channel: u8,
         text: &str,
         reply_to: Option<MessageRef>,
-        want_ack: bool,
+        kind: Outgoing,
     ) -> Result<MessageRef> {
         let channel = MeshChannel::new(u32::from(channel)).map_err(|error| {
             anyhow::anyhow!("channel {channel} is not one a radio has: {error}")
@@ -635,7 +670,7 @@ impl MeshtasticBackend {
             None => bail!("network {:?} is not connected", self.id),
         };
 
-        let packet = self.outgoing(to, channel, text, reply_to.as_ref(), want_ack);
+        let packet = self.outgoing(to, channel, text, reply_to.as_ref(), kind);
         let id = MessageRef::Packet(packet.id);
         // Logged before sending, and with the packet id, because that is what the
         // radio's queue report comes back naming.
@@ -705,7 +740,7 @@ impl MeshBackend for MeshtasticBackend {
         reply_to: Option<MessageRef>,
     ) -> Result<Broadcast> {
         let reference = self
-            .transmit(BROADCAST_ADDR, channel, text, reply_to, false)
+            .transmit(BROADCAST_ADDR, channel, text, reply_to, Outgoing::default())
             .await?;
         Ok(Broadcast {
             reference: Some(reference.clone()),
@@ -722,7 +757,18 @@ impl MeshBackend for MeshtasticBackend {
         };
         // The primary channel, which is where a direct message goes: the address
         // is what makes it private, not the channel.
-        let sent = self.transmit(*num, 0, text, None, true).await?;
+        let sent = self
+            .transmit(
+                *num,
+                0,
+                text,
+                None,
+                Outgoing {
+                    want_ack: true,
+                    tapback: false,
+                },
+            )
+            .await?;
         let MessageRef::Packet(id) = sent else {
             unreachable!("this backend only ever sends packets");
         };
@@ -744,6 +790,48 @@ impl MeshBackend for MeshtasticBackend {
         })
     }
 
+    /// A tapback: the emoji as the payload, the packet it is about in
+    /// `reply_id`, and the `emoji` flag that tells the two apart. The sender's
+    /// name is not written into it — the packet carries our node number and
+    /// every client resolves that itself — so the prefix goes unused here.
+    async fn react_channel(&self, channel: u8, reaction: &Reaction<'_>) -> Result<()> {
+        let about = self.tapback_target(reaction)?;
+        self.transmit(
+            BROADCAST_ADDR,
+            channel,
+            reaction.emoji,
+            Some(about),
+            Outgoing {
+                want_ack: false,
+                tapback: true,
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// The same packet, addressed to one node. No acknowledgement is asked for:
+    /// there is nothing to report about an annotation, and a tick on a reaction
+    /// would say less than the reaction itself.
+    async fn react_direct(&self, peer: &PeerId, reaction: &Reaction<'_>) -> Result<()> {
+        let PeerId::Node(num) = peer else {
+            bail!("{peer} is not a Meshtastic address");
+        };
+        let about = self.tapback_target(reaction)?;
+        self.transmit(
+            *num,
+            0,
+            reaction.emoji,
+            Some(about),
+            Outgoing {
+                want_ack: false,
+                tapback: true,
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
     fn resolve_name(&self, peer: &PeerId) -> Option<String> {
         let PeerId::Node(num) = peer else {
             return None;
@@ -753,6 +841,15 @@ impl MeshBackend for MeshtasticBackend {
             .ok()?
             .get(num)
             .and_then(|sender| sender.display_name().map(str::to_owned))
+    }
+
+    /// Zero until the radio has said who it is, which is also what an unknown
+    /// node number looks like, so neither is claimed as an address.
+    fn own_address(&self) -> Option<PeerId> {
+        match self.my_node_num.load(Ordering::Relaxed) {
+            0 => None,
+            num => Some(PeerId::Node(num)),
+        }
     }
 }
 
@@ -894,7 +991,10 @@ mod tests {
             MeshChannel::new(0).expect("channel nought"),
             "hola",
             None,
-            true,
+            Outgoing {
+                want_ack: true,
+                tapback: false,
+            },
         );
         assert!(direct.want_ack, "nobody would answer otherwise");
 
@@ -903,7 +1003,7 @@ mod tests {
             MeshChannel::new(0).expect("channel nought"),
             "hola",
             None,
-            false,
+            Outgoing::default(),
         );
         assert!(
             !broadcast.want_ack,
@@ -1210,6 +1310,33 @@ mod tests {
         }
     }
 
+    /// The three fields that make a packet a tapback rather than somebody
+    /// typing a thumbs-up, which is a distinction only `emoji` draws.
+    #[test]
+    fn a_tapback_says_it_is_one() {
+        let packet = offline_backend().outgoing(
+            BROADCAST_ADDR,
+            MeshChannel::new(0).expect("channel nought"),
+            "\u{1f44d}",
+            Some(&MessageRef::Packet(0xbeef)),
+            Outgoing {
+                want_ack: false,
+                tapback: true,
+            },
+        );
+        let Some(protobufs::mesh_packet::PayloadVariant::Decoded(data)) = packet.payload_variant
+        else {
+            panic!("a text packet carries decoded data");
+        };
+        assert_eq!(data.payload, "\u{1f44d}".as_bytes());
+        assert_eq!(data.reply_id, 0xbeef, "a tapback has to point at something");
+        assert_eq!(data.emoji, 1);
+        assert!(
+            !packet.want_ack,
+            "an annotation is not worth a round trip of its own"
+        );
+    }
+
     /// The regression that matters most in this file. A packet sent with a hop limit
     /// of zero is transmitted and then repeated by nobody, so it reaches whatever is
     /// in earshot and stops there — a relay that looks connected, queues its
@@ -1221,7 +1348,7 @@ mod tests {
             MeshChannel::new(0).expect("channel nought"),
             "bos dias",
             None,
-            false,
+            Outgoing::default(),
         );
         assert_ne!(
             packet.hop_limit, 0,
@@ -1240,7 +1367,7 @@ mod tests {
             MeshChannel::new(0).expect("channel nought"),
             "bos dias",
             None,
-            false,
+            Outgoing::default(),
         );
         assert_eq!(packet.hop_limit, 5);
     }
@@ -1275,7 +1402,7 @@ mod tests {
             MeshChannel::new(3).expect("channel three"),
             "hola",
             None,
-            false,
+            Outgoing::default(),
         );
 
         assert_eq!(packet.from, 42);

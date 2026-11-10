@@ -38,7 +38,7 @@ mod mc1;
 use crate::config::{NetworkConfig, NetworkKind, Transport};
 use crate::mesh::{
     Broadcast, Delivery, IncomingMesh, MeshBackend, MeshKind, MessageRef, NetworkId, Origin,
-    PeerId, RelayWatch, Sender,
+    PeerId, Reaction, RelayWatch, Sender,
 };
 
 /// Conservative text budget. MeshCore does not expose a payload constant the way
@@ -189,6 +189,13 @@ fn hops(header: &MeshPacketHeader) -> String {
         .map(|hop| hop.iter().map(|byte| format!("{byte:02x}")).collect())
         .collect::<Vec<String>>()
         .join("-")
+}
+
+/// Why a channel reaction cannot go out: MC1 writes the reaction against the
+/// name of whoever wrote the message, and without that name there is nothing
+/// to write.
+fn no_author(network: &str) -> String {
+    format!("nobody to name in a reaction on {network}, so it stays in Matrix")
 }
 
 /// Now, as the protocol counts it: whole seconds since the epoch.
@@ -756,6 +763,45 @@ impl MeshCoreBackend {
     }
 
     /// Wait until this network's turn to transmit comes round.
+    /// What a reaction from Matrix says and what it is about, refusing what
+    /// this protocol has no way of writing.
+    ///
+    /// A fingerprint is the only thing that names a MeshCore message — a packet
+    /// id names a Meshtastic one, and nothing at all means the message is older
+    /// than this relay's memory of it. The emoji has to be one: anything else
+    /// would reach the channel as `@[ALICE]lol` followed by eight characters,
+    /// which no client reads as a reaction and every client shows as a line.
+    fn reaction_parts<'a>(&self, reaction: &Reaction<'a>) -> Result<(&'a str, &'a str)> {
+        let Some(MessageRef::Digest(about)) = reaction.about else {
+            bail!(
+                "nothing on {} for a reaction to name, so it stays in Matrix",
+                self.id
+            );
+        };
+        if !mc1::is_emoji(reaction.emoji) {
+            bail!(
+                "{:?} is not an emoji, and MeshCore would show it as a line of text",
+                reaction.emoji
+            );
+        }
+        Ok((reaction.emoji, about))
+    }
+
+    /// A reaction cannot be cut to fit the way a message can: the fingerprint
+    /// is at the end of it, and a fingerprint with its tail missing names
+    /// nothing. So an overlong one is refused instead, which takes a name long
+    /// enough to be a sentence.
+    fn check_fits(&self, text: &str) -> Result<()> {
+        if text.len() > MAX_TEXT_LEN {
+            bail!(
+                "a reaction of {} B does not fit {MAX_TEXT_LEN} B on {}",
+                text.len(),
+                self.id
+            );
+        }
+        Ok(())
+    }
+
     async fn pace(&self) {
         let mut next_send = self.next_send.lock().await;
         if let Some(at) = *next_send {
@@ -912,6 +958,67 @@ impl MeshBackend for MeshCoreBackend {
             ack,
             within: Duration::from_millis(u64::from(sent.suggested_timeout)),
         })
+    }
+
+    /// A reaction is an ordinary channel message whose text follows the MC1
+    /// convention, so this goes out exactly like one — prefix included, since
+    /// the prefix is how every client on the channel will know who reacted.
+    ///
+    /// The fingerprint is the message's own, not this one's, so the timestamp
+    /// stamped here is of no consequence beyond being a timestamp.
+    async fn react_channel(&self, channel: u8, reaction: &Reaction<'_>) -> Result<()> {
+        let (emoji, about) = self.reaction_parts(reaction)?;
+        let Some(MessageRef::Author(author)) = reaction.reply_to else {
+            bail!("{}", no_author(&self.id));
+        };
+        let text = format!(
+            "{}{}",
+            reaction.prefix,
+            mc1::render_channel(author, emoji, about)
+        );
+        self.check_fits(&text)?;
+
+        let client = self.connected().await?;
+        self.pace().await;
+        client
+            .as_ref()
+            .expect("checked just above")
+            .commands()
+            .lock()
+            .await
+            .send_channel_msg(channel, &text, Some(now_secs()))
+            .await
+            .with_context(|| format!("reacting on {} channel {channel}", self.id))?;
+        Ok(())
+    }
+
+    /// And the same within a direct message, where the convention drops the
+    /// marker — and the prefix with it: anything in front of the emoji makes
+    /// the far client read a line of text rather than a reaction, and in a
+    /// conversation of two there is nobody it could name anyway.
+    async fn react_direct(&self, peer: &PeerId, reaction: &Reaction<'_>) -> Result<()> {
+        let PeerId::KeyPrefix(prefix) = peer else {
+            bail!("{peer} is not a MeshCore address");
+        };
+        let (emoji, about) = self.reaction_parts(reaction)?;
+        let text = mc1::render_direct(emoji, about);
+        self.check_fits(&text)?;
+
+        let client = self.connected().await?;
+        self.pace().await;
+        // No acknowledgement is waited on: there is nothing to report about an
+        // annotation, and the tag would be registered for a reader that never
+        // comes.
+        client
+            .as_ref()
+            .expect("checked just above")
+            .commands()
+            .lock()
+            .await
+            .send_msg(&prefix[..], &text, Some(now_secs()))
+            .await
+            .with_context(|| format!("reacting in a direct message on {}", self.id))?;
+        Ok(())
     }
 
     fn resolve_name(&self, peer: &PeerId) -> Option<String> {

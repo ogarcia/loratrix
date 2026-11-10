@@ -160,6 +160,34 @@ pub struct Broadcast {
     pub relays: Option<RelayWatch>,
 }
 
+/// A reaction on its way from Matrix to the mesh.
+///
+/// It carries *both* names for the message it is about, because the two
+/// protocols want different ones: Meshtastic names the packet it is annotating,
+/// while MeshCore names the person who wrote the message and fingerprints the
+/// message itself. A backend takes the one it speaks and ignores the other.
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "each backend reads the fields its protocol names, and a build may have only one"
+)]
+pub struct Reaction<'a> {
+    /// Whatever the prefix template made of the Matrix sender, ready to go in
+    /// front of the text. Only written where the protocol puts the sender into
+    /// the message, which is MeshCore; Meshtastic has a field for it.
+    pub prefix: &'a str,
+    /// The annotation itself. Matrix allows any short string here and clients
+    /// send an emoji, which is also the only thing a mesh client will show as
+    /// a reaction rather than as a puzzle.
+    pub emoji: &'a str,
+    /// What a *reply* to the message names, which on MeshCore is the person who
+    /// wrote it, and is part of how a reaction there is written.
+    pub reply_to: Option<&'a MessageRef>,
+    /// What a *reaction* names: the packet id on Meshtastic, the fingerprint on
+    /// MeshCore.
+    pub about: Option<&'a MessageRef>,
+}
+
 /// A watch on the repeaters that carry one broadcast.
 ///
 /// Nothing in either protocol reports what becomes of a message sent to a
@@ -320,8 +348,30 @@ pub trait MeshBackend: Send + Sync {
     /// Returns what to wait on to find out whether it arrived. See [`Delivery`].
     async fn send_direct(&self, peer: &PeerId, text: &str) -> Result<Delivery>;
 
+    /// Relay a reaction written in Matrix onto a channel.
+    ///
+    /// A backend that cannot express this particular reaction says so rather
+    /// than sending something unreadable: a protocol with no convention for it,
+    /// a message it has no name for, or an annotation that is not an emoji and
+    /// would reach the channel as a line of text nobody asked for.
+    async fn react_channel(&self, channel: u8, reaction: &Reaction<'_>) -> Result<()>;
+
+    /// The same within a direct message, where there is nobody to name: the
+    /// conversation has two ends and the address says which is which.
+    async fn react_direct(&self, peer: &PeerId, reaction: &Reaction<'_>) -> Result<()>;
+
     /// Resolve a peer to a display name from whatever cache the backend keeps.
     fn resolve_name(&self, peer: &PeerId) -> Option<String>;
+
+    /// This relay's own address on the mesh, where the protocol gives it one.
+    ///
+    /// Only used to recognize our own message when the radio hands it straight
+    /// back: a Meshtastic radio reports what it transmits to every client
+    /// attached, this one included. [`None`] where the protocol carries no
+    /// address, which is every MeshCore channel message.
+    fn own_address(&self) -> Option<PeerId> {
+        None
+    }
 }
 
 #[cfg(test)]

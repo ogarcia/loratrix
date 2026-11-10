@@ -25,7 +25,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{Config, NetworkKind};
-use crate::matrix::{MatrixSink, http::HttpSink};
+use crate::matrix::{MatrixEvent, MatrixSink, http::HttpSink};
 use crate::mesh::MeshBackend;
 use crate::router::Router;
 
@@ -240,8 +240,15 @@ async fn relay(
             Some(message) = mesh_rx.recv() => {
                 router.handle_mesh(message, Instant::now()).await;
             }
-            Some(message) = matrix_rx.recv() => {
-                router.handle_matrix(message, Instant::now()).await;
+            Some(event) = matrix_rx.recv() => {
+                match event {
+                    MatrixEvent::Message(message) => {
+                        router.handle_matrix(message, Instant::now()).await;
+                    }
+                    MatrixEvent::Reaction(reaction) => {
+                        router.handle_matrix_reaction(reaction, Instant::now()).await;
+                    }
+                }
             }
             Some(finished) = runners.join_next() => {
                 // A runner is expected to retry internally, so its return means

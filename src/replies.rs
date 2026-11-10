@@ -87,6 +87,11 @@ pub struct Replies {
     /// Where each mesh message ended up in Matrix, for attaching a reaction that
     /// arrives afterwards.
     posted: HashMap<u64, (Posted, Instant)>,
+    /// And what a reaction travelling the other way has to name, which is not
+    /// what a reply names: see [`crate::mesh::MessageRef`]. Keyed like `known`,
+    /// by event and network, because the same Matrix event is a different
+    /// message on each mesh it was carried to.
+    reactable: HashMap<u64, (MessageRef, Instant)>,
 }
 
 impl Replies {
@@ -96,6 +101,7 @@ impl Replies {
             known: HashMap::new(),
             correspondents: HashMap::new(),
             posted: HashMap::new(),
+            reactable: HashMap::new(),
         }
     }
 
@@ -125,6 +131,35 @@ impl Replies {
     pub fn remember(&mut self, event: &str, network: &str, message: MessageRef, now: Instant) {
         self.prune(now);
         self.known.insert(key(event, network), (message, now));
+    }
+
+    /// Record what a reaction on `network` would have to name in order to land
+    /// on the mesh copy of `event`.
+    ///
+    /// Beside [`remember`] rather than part of it: a reply and a reaction name
+    /// different things on MeshCore — the person and the message — and a
+    /// message may be reactable without being replyable, which is any channel
+    /// message whose sender's name we could not recover.
+    ///
+    /// [`remember`]: Replies::remember
+    pub fn remember_reactable(
+        &mut self,
+        event: &str,
+        network: &str,
+        message: MessageRef,
+        now: Instant,
+    ) {
+        self.prune(now);
+        self.reactable.insert(key(event, network), (message, now));
+    }
+
+    /// What to name on `network` in order to react to `event`, if we still
+    /// know. As everywhere here, reading does not forget.
+    pub fn reaction_for(&self, event: &str, network: &str, now: Instant) -> Option<MessageRef> {
+        self.reactable
+            .get(&key(event, network))
+            .filter(|(_, at)| now.duration_since(*at) < self.window)
+            .map(|(message, _)| message.clone())
     }
 
     /// The same fact the other way round: where on Matrix a mesh message ended
@@ -189,9 +224,12 @@ impl Replies {
             .retain(|_, (_, at)| now.duration_since(*at) < window);
         self.posted
             .retain(|_, (_, at)| now.duration_since(*at) < window);
+        self.reactable
+            .retain(|_, (_, at)| now.duration_since(*at) < window);
         trim(&mut self.known);
         trim(&mut self.correspondents);
         trim(&mut self.posted);
+        trim(&mut self.reactable);
     }
 
     #[cfg(test)]
@@ -324,6 +362,31 @@ mod tests {
             replies.len() <= MAX_ENTRIES,
             "the ceiling must hold: {} entries",
             replies.len()
+        );
+    }
+
+    /// The two references come apart on MeshCore, and a reaction must not be
+    /// sent against the one a reply uses.
+    #[test]
+    fn a_reply_and_a_reaction_name_different_things() {
+        let mut replies = Replies::new(WINDOW);
+        let now = Instant::now();
+        replies.remember("$abc", "mc", MessageRef::Author("ALICE".to_owned()), now);
+        replies.remember_reactable("$abc", "mc", MessageRef::Digest("b45pc4ek".to_owned()), now);
+
+        assert_eq!(
+            replies.message_for("$abc", "mc", now),
+            Some(MessageRef::Author("ALICE".to_owned()))
+        );
+        assert_eq!(
+            replies.reaction_for("$abc", "mc", now),
+            Some(MessageRef::Digest("b45pc4ek".to_owned()))
+        );
+        assert_eq!(replies.reaction_for("$abc", "other", now), None);
+        assert_eq!(
+            replies.reaction_for("$abc", "mc", now + Duration::from_secs(3601)),
+            None,
+            "and it ages out with everything else"
         );
     }
 

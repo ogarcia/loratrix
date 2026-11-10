@@ -124,6 +124,22 @@ pub fn parse_direct(text: &str) -> Option<Reaction> {
     })
 }
 
+/// Write a channel reaction the way MC1 reads one: the marker naming whoever
+/// wrote the message being reacted to, the emoji, and then the fingerprint of
+/// that message on a line of its own.
+///
+/// The current order of the two, never the one from before 1.4.1: both are
+/// read on the way in, and there is no reason to write the older one.
+pub fn render_channel(author: &str, emoji: &str, about: &str) -> String {
+    format!("{}{author}]{emoji}\n{about}", super::REPLY_OPEN)
+}
+
+/// And within a direct message, where the marker goes: there is nobody to name
+/// in a conversation of two.
+pub fn render_direct(emoji: &str, about: &str) -> String {
+    format!("{emoji}\n{about}")
+}
+
 /// Cut the trailing fingerprint off, giving what came before it.
 ///
 /// The separator is a newline. It is also sometimes a space: a channel message
@@ -174,7 +190,7 @@ fn normalize(text: &str) -> Option<String> {
 /// Erring either way is cheap here: a reaction we fail to recognize arrives as
 /// the text it is, and a message mistaken for one has to end in a valid
 /// fingerprint and carry a marker as well.
-fn is_emoji(text: &str) -> bool {
+pub fn is_emoji(text: &str) -> bool {
     if text.is_empty() || text.chars().count() > MAX_EMOJI_SCALARS {
         return false;
     }
@@ -413,6 +429,31 @@ mod tests {
         assert_eq!(parse_direct("@[ALICE]👍\nb45pc4ek"), None);
         // And a plain line that happens to end in eight good characters.
         assert_eq!(parse_direct("hasta luego\nb45pc4ek"), None);
+    }
+
+    /// What goes out has to be what we would read coming back, or a reaction
+    /// sent from Matrix reaches the channel as a line of nonsense.
+    #[test]
+    fn what_is_written_is_what_is_read() {
+        let written = render_channel("ALICE", "\u{1f602}", "b45pc4ek");
+        assert_eq!(written, "@[ALICE]\u{1f602}\nb45pc4ek");
+        assert_eq!(
+            parse_channel(&written),
+            Some(Reaction {
+                emoji: "\u{1f602}".to_owned(),
+                about: "b45pc4ek".to_owned(),
+            })
+        );
+
+        let written = render_direct("\u{1f44d}", "b45pc4ek");
+        assert_eq!(written, "\u{1f44d}\nb45pc4ek");
+        assert_eq!(
+            parse_direct(&written),
+            Some(Reaction {
+                emoji: "\u{1f44d}".to_owned(),
+                about: "b45pc4ek".to_owned(),
+            })
+        );
     }
 
     #[test]
